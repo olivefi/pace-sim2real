@@ -5,7 +5,7 @@
 from __future__ import annotations
 import torch
 
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 
 from isaaclab.actuators import DCMotorCfg
 from pace_sim2real.utils import pace_actuator
@@ -20,3 +20,5 @@ class PaceDCMotorCfg(DCMotorCfg):
     class_type: type = pace_actuator.PaceDCMotor
     encoder_bias: dict[str, float] | float | None = 0.0
     max_delay: torch.int | None = 0
+    static_friction: dict[str, float] | float | None = 0.0
+    """Static friction torque [N·m] applied against the direction of motion. Defaults to 0."""

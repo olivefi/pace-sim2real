@@ -40,6 +40,7 @@ class PaceDCMotor(DCMotor):
                     f"but got {len(cfg.encoder_bias)}: {cfg.encoder_bias}"
                 )
         self.encoder_bias = self._parse_joint_parameter(cfg.encoder_bias, 0.0)
+        self.static_friction = self._parse_joint_parameter(cfg.static_friction, 0.0)
 
         self.torques_delay_buffer = DelayBuffer(cfg.max_delay + 1, self._num_envs, device=self._device)
         self.torques_delay_buffer.set_time_lag(cfg.max_delay, torch.arange(self._num_envs, device=self._device))
@@ -52,6 +53,9 @@ class PaceDCMotor(DCMotor):
     def update_encoder_bias(self, encoder_bias: torch.Tensor):
         self.encoder_bias = encoder_bias
 
+    def update_static_friction(self, static_friction: torch.Tensor):
+        self.static_friction = static_friction
+
     def update_time_lags(self, delay: int | torch.Tensor, env_ids: Sequence[int] | None = None):
         if env_ids is None:
             env_ids = torch.arange(self._num_envs, device=self._device)
@@ -62,5 +66,7 @@ class PaceDCMotor(DCMotor):
     ) -> ArticulationActions:
         # compute actuator model with encoder bias added to joint positions (joint position in encoder frame, not simulation frame)
         control_action_sim = super().compute(control_action, joint_pos - self.encoder_bias, joint_vel)
-        control_action_sim.joint_efforts = self.torques_delay_buffer.compute(control_action_sim.joint_efforts)
+        if control_action_sim.joint_efforts is not None:
+            control_action_sim.joint_efforts -= self.static_friction * torch.sign(joint_vel)
+            control_action_sim.joint_efforts = self.torques_delay_buffer.compute(control_action_sim.joint_efforts)
         return control_action_sim

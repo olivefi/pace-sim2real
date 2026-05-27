@@ -16,10 +16,32 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 # from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from isaaclab_newton.physics import KaminoSolverCfg, NewtonCfg
+from isaaclab_physx.physics import PhysxCfg
+from isaaclab_tasks.utils import PresetCfg
+
 from . import mdp
+
+
+##
+# Physics backend
+##
+
+
+@configclass
+class PacePhysicsCfg(PresetCfg):
+    """Physics backend presets for Pace Sim2Real environments."""
+
+    default: PhysxCfg = PhysxCfg()
+    physx: PhysxCfg = PhysxCfg()
+    newton_kamino: NewtonCfg = NewtonCfg(
+        solver_cfg=KaminoSolverCfg(),
+        num_substeps=1,
+        use_cuda_graph=True,
+    )
 
 
 ##
@@ -144,4 +166,5 @@ class PaceSim2realEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 0.0025  # 400Hz simulation
         self.sim.render_interval = 4  # render at 100Hz
 
-        self.scene.robot.spawn.articulation_props.fix_root_link = True
+        self.sim.physics = PacePhysicsCfg()
+        # self.scene.robot.spawn.articulation_props.fix_root_link = True
