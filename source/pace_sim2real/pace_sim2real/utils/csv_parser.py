@@ -13,9 +13,9 @@ import torch
 
 # Maps CSV column prefix → index in joint_order ["T_motor", "L_motor", "R_motor"]
 _DELTA_CSV_PREFIX_TO_IDX: dict[str, int] = {
-    "joint_upper_arm1": 0,  # T_motor
-    "joint_upper_arm2": 2,  # R_motor
-    "joint_upper_arm3": 1,  # L_motor
+    "T_motor": 0,  # T_motor
+    "L_motor": 1,  # L_motor
+    "R_motor": 2,  # R_motor
 }
 
 
@@ -27,9 +27,9 @@ def parse_delta_csv(
 
     The CSV must contain the following columns (written by the delta robot's logging):
         t
-        joint_upper_arm{1,2,3}_target   — commanded position [rad]
-        joint_upper_arm{1,2,3}_pos      — measured position  [rad]
-        joint_upper_arm{1,2,3}_vel      — measured velocity  [rad/s]
+        {T_motor, L_motor, R_motor}_target   — commanded position [rad]
+        {T_motor, L_motor, R_motor}_pos      — measured position  [rad]
+        {T_motor, L_motor, R_motor}_vel      — measured velocity  [rad/s]
 
     The returned dict maps to the three simulation joints in order
     ``["T_motor", "L_motor", "R_motor"]``, which is the ``joint_order`` defined in

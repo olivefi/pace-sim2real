@@ -60,7 +60,7 @@ def main():
     out_path = args.out if args.out is not None else root / _DEFAULT_OUT
 
     print(f"[INFO] Reading CSV:   {csv_path}")
-    data = parse_delta_csv(csv_path, invert_dofs=[0,1])
+    data = parse_delta_csv(csv_path)
 
     T = data["time"].shape[0]
     duration = data["time"][-1].item()

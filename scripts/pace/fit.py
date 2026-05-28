@@ -59,11 +59,7 @@ def main():
         data = torch.load(data_file)
         time_data = data["time"].to(env.unwrapped.device)
         target_dof_pos = data["des_dof_pos"].to(env.unwrapped.device)
-        target_dof_pos[:, 0] *= -1.0  # flip the T_motor direction to match the sim's joint convention
-
         measured_dof_pos = data["dof_pos"].to(env.unwrapped.device)
-        measured_dof_pos[:, 0] *= -1.0  # flip the T_motor direction to match the sim's joint convention
-
         initial_dof_pos = measured_dof_pos[0, :].unsqueeze(0).repeat(env.unwrapped.num_envs, 1)
 
         time_steps = time_data.shape[0]
