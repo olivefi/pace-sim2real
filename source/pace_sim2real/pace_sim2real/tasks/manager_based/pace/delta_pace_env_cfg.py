@@ -3,7 +3,8 @@
 # Licensed under the Apache License 2.0
 
 import torch
-from isaaclab_newton.physics import KaminoSolverCfg, NewtonCfg
+from isaaclab.actuators.actuator_pd_cfg import ImplicitActuatorCfg
+from isaaclab_newton.physics import KaminoSolverCfg, NewtonCfg, NewtonShapeCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
@@ -29,12 +30,29 @@ class DeltaPacePhysicsCfg(PresetCfg):
 
     The delta robot's parallel-arm topology contains PhysicsSphericalJoint
     loop-closing constraints that PhysX cannot handle; Kamino is required.
+
+    The ``default`` preset deliberately mirrors the solver settings used in
+    ``replay_pace_traj.py`` so that rollout and replay are comparable:
+    Kamino's internal collision detector with the "primitive" pipeline, looser
+    PADMM tolerances (1e-4) and smaller rho_0 (0.1) that converge reliably
+    within the 200-iteration budget, and "geom_pair_net_force" warm-start.
     """
 
     default: NewtonCfg = NewtonCfg(
-        solver_cfg=KaminoSolverCfg(use_fk_solver=False),
-        num_substeps=1,
+        solver_cfg=KaminoSolverCfg(
+            use_fk_solver=False,
+            use_collision_detector=True,
+            collision_detector_pipeline="primitive",
+            collision_detector_max_contacts_per_pair=32,
+            padmm_primal_tolerance=1e-4,
+            padmm_dual_tolerance=1e-4,
+            padmm_compl_tolerance=1e-4,
+            padmm_rho_0=0.1,
+            padmm_contact_warmstart_method="geom_pair_net_force",
+        ),
+        num_substeps=4,
         use_cuda_graph=True,
+        default_shape_cfg=NewtonShapeCfg(gap=0.0),
     )
     newton_kamino: NewtonCfg = NewtonCfg(
         solver_cfg=KaminoSolverCfg(use_fk_solver=False),
@@ -58,7 +76,7 @@ DELTA_MOTOR_PACE_CFG = PaceDCMotorCfg(
     friction=0.0,
     dynamic_friction=0.0,
     viscous_friction=0.0,
-    max_delay=0,
+    max_delay=2,
 )
 """PaceDCMotorCfg for the three delta robot motors.
 
@@ -75,12 +93,19 @@ zero as initial conditions; CMA-ES will optimise all of these.
 @configclass
 class DeltaPaceSceneCfg(PaceSim2realSceneCfg):
     """Scene with the delta robot, motors replaced by PaceDCMotor for sys-id."""
-
     robot: ArticulationCfg = DELTA_ALLREV_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Robot",
         actuators={
             "motors": DELTA_MOTOR_PACE_CFG,
         },
+        # actuators={
+        #     "motors": ImplicitActuatorCfg(
+        #         joint_names_expr=["T_motor", "L_motor", "R_motor"],
+        #         effort_limit_sim=1000.0,
+        #         stiffness=5.0,
+        #         damping=0.2,
+        #     ),
+        # },
     )
 
 
@@ -116,7 +141,7 @@ class DeltaPaceCfg(PaceCfg):
         self.bounds_params[2 * n : 3 * n, 1] = 2.0  # friction [0, 0.5] Nm
         self.bounds_params[3 * n : 4 * n, 0] = -0.1
         self.bounds_params[3 * n : 4 * n, 1] = 0.1  # bias [-0.1, 0.1] rad
-        self.bounds_params[4 * n, 1] = 2.0     # delay [0, 10] sim steps
+        self.bounds_params[4 * n, 1] = 2.0     # delay [0, 2] sim steps
 
 
 ##
@@ -135,7 +160,9 @@ class DeltaPaceEnvCfg(PaceSim2realEnvCfg):
         # DELTA_ALLREV_CFG.spawn has articulation_props=None; the base class
         # __post_init__ unconditionally sets fix_root_link on it, so initialise first.
         if self.scene.robot.spawn.articulation_props is None:
-            self.scene.robot.spawn.articulation_props = sim_utils.ArticulationRootPropertiesCfg()
+            self.scene.robot.spawn.articulation_props = sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=False
+            )
         super().__post_init__()
 
         self.sim.dt = 0.005
