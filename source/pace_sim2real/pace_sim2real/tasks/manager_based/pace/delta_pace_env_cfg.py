@@ -17,6 +17,7 @@ from pace_sim2real import PaceCfg, PaceSim2realEnvCfg, PaceSim2realSceneCfg
 from pace_sim2real.utils import PaceDCMotorCfg
 
 from lunarleaper_isaaclab.assets.robots.delta_robot import DELTA_ALLREV_CFG  # isort: skip
+from . import mdp
 
 
 ##
@@ -50,7 +51,7 @@ class DeltaPacePhysicsCfg(PresetCfg):
             padmm_rho_0=0.1,
             padmm_contact_warmstart_method="geom_pair_net_force",
         ),
-        num_substeps=4,
+        num_substeps=1,
         use_cuda_graph=True,
         default_shape_cfg=NewtonShapeCfg(gap=0.0),
     )
@@ -143,6 +144,18 @@ class DeltaPaceCfg(PaceCfg):
         self.bounds_params[3 * n : 4 * n, 1] = 0.1  # bias [-0.1, 0.1] rad
         self.bounds_params[4 * n, 1] = 2.0     # delay [0, 2] sim steps
 
+@configclass
+class DeltaActionsCfg:
+    """Action specifications for the MDP."""
+
+    joint_pos = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["T_motor", "L_motor", "R_motor"],
+        preserve_order=True,
+        scale=1.0,
+        use_default_offset=True,
+    )  # actions = absolute joint position targets, in [T, L, R] order
+
 
 ##
 # Environment configuration
@@ -155,6 +168,7 @@ class DeltaPaceEnvCfg(PaceSim2realEnvCfg):
 
     scene: DeltaPaceSceneCfg = DeltaPaceSceneCfg()
     sim2real: DeltaPaceCfg = DeltaPaceCfg()
+    actions: DeltaActionsCfg = DeltaActionsCfg()
 
     def __post_init__(self):
         # DELTA_ALLREV_CFG.spawn has articulation_props=None; the base class
@@ -171,14 +185,3 @@ class DeltaPaceEnvCfg(PaceSim2realEnvCfg):
         # Kamino-only physics (required for closed-loop kinematics).
         self.sim.physics = DeltaPacePhysicsCfg()
 
-        # Restrict actions and observations to the 3 motor joints.
-        # The base class uses joint_names=[".*"] / no asset_cfg, which would include
-        # all 17 articulation joints and cause a size mismatch against default_joint_pos
-        # (which only covers the 15 joints declared in DELTA_ALLREV_CFG.init_state).
-        # Each term gets its own SceneEntityCfg instance — resolve() mutates joint_ids
-        # in-place, so sharing one object between terms causes a consistency error on
-        # the second resolve.
-        _motor_names = ["T_motor", "L_motor", "R_motor"]
-        self.actions.joint_pos.joint_names = _motor_names
-        self.observations.policy.joint_pos.params = {"asset_cfg": SceneEntityCfg("robot", joint_names=_motor_names)}
-        self.observations.policy.joint_vel.params = {"asset_cfg": SceneEntityCfg("robot", joint_names=_motor_names)}

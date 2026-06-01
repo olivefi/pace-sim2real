@@ -18,7 +18,7 @@ from isaaclab_tasks.utils import (
 
 parser = argparse.ArgumentParser(description="Play back a saved trajectory in a Newton environment.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default="Isaac-Pace-Delta-v0", help="Name of the task.")
+parser.add_argument("--task", type=str, default="Isaac-Pace-Delta-v1", help="Name of the task.")
 parser.add_argument("--data_file", type=str, default=None, help="Path to a .pt trajectory file.")
 add_launcher_args(parser)
 args_cli, hydra_args = setup_preset_cli(parser)
@@ -35,7 +35,7 @@ import pace_sim2real.tasks  # noqa: F401, E402
 from pace_sim2real.utils import project_root  # noqa: E402
 
 _PLOT_UPDATE_INTERVAL = 10
-_DEFAULT_JOINT_NAMES = ["motor1", "motor2", "motor3"]
+_DEFAULT_JOINT_NAMES = ["T_motor", "L_motor", "R_motor"]
 
 
 def _setup_live_plot(time_np, target_np, real_np, joint_names):
@@ -66,7 +66,7 @@ def _setup_live_plot(time_np, target_np, real_np, joint_names):
 
 
 def main():
-    env_cfg, _ = resolve_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+    env_cfg, _ = resolve_task_config(args_cli.task, "env_cfg_entry_point")
 
     with launch_simulation(env_cfg, args_cli):
         env_cfg.scene.num_envs = args_cli.num_envs

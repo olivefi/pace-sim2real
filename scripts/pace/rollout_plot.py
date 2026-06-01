@@ -25,6 +25,13 @@ parser.add_argument("--folder_name", type=str, default=None, help="Log folder na
 parser.add_argument("--mean_name", type=str, default=None, help="Params file name, e.g. mean_050.pt (default: latest).")
 parser.add_argument("--robot_name", type=str, default=None, help="Robot name for log dir (default: from env cfg).")
 parser.add_argument("--save_plot", type=str, default=None, help="Save plots to this directory instead of showing.")
+parser.add_argument(
+    "--implicit_actuator",
+    action="store_true",
+    default=False,
+    help="Replace PACE actuator with ImplicitActuatorCfg (same drive mode as replay_pace_traj.py). "
+    "Disables PACE physics params; useful for isolating control-frequency effects.",
+)
 add_launcher_args(parser)
 args_cli, hydra_args = setup_preset_cli(parser)
 sys.argv = [sys.argv[0]] + fold_preset_tokens(hydra_args)
@@ -35,6 +42,7 @@ import gymnasium as gym  # noqa: E402
 
 import isaaclab_tasks  # noqa: F401, E402
 import pace_sim2real.tasks  # noqa: F401, E402
+from isaaclab.actuators import ImplicitActuatorCfg  # noqa: E402
 from pace_sim2real.utils import project_root  # noqa: E402
 
 
@@ -53,8 +61,13 @@ def find_latest_params(root: Path):
     return (None, None) if best is None else (best[1], best[0])
 
 
-def apply_params(articulation, sim_joint_ids, sim_params, initial_dof_pos, device):
-    """Apply a single set of physical parameters (shape [1, n_params]) to the articulation."""
+def apply_params(articulation, sim_joint_ids, sim_params, device):
+    """Apply physics parameters (armature, friction, actuator config) to the articulation.
+
+    Joint position and velocity must be written separately, AFTER the Kamino reset mask has
+    been consumed by the first env.step().  Writing joint state before that step would be
+    silently overwritten by solver.reset() inside _forward_kamino.
+    """
     n = sim_joint_ids.shape[0]
     armature_idx = slice(0, n)
     static_friction_idx = slice(n, 2 * n)
@@ -70,12 +83,6 @@ def apply_params(articulation, sim_joint_ids, sim_params, initial_dof_pos, devic
     articulation.write_joint_friction_coefficient_to_sim_index(
         joint_friction_coeff=sim_params[:, viscous_friction_idx], joint_ids=sim_joint_ids, env_ids=env_ids
     )
-    articulation.write_joint_position_to_sim_index(
-        position=initial_dof_pos + sim_params[:, bias_idx], joint_ids=sim_joint_ids
-    )
-    articulation.write_joint_velocity_to_sim_index(
-        velocity=torch.zeros_like(initial_dof_pos), joint_ids=sim_joint_ids
-    )
 
     for actuator in articulation.actuators.values():
         if not hasattr(actuator, "update_encoder_bias"):
@@ -90,10 +97,25 @@ def apply_params(articulation, sim_joint_ids, sim_params, initial_dof_pos, devic
         actuator.update_static_friction(sim_params[:, static_friction_idx][:, drive_joint_idx])
         actuator.update_time_lags(sim_params[:, delay_idx].to(torch.int))
         actuator.reset(env_ids)
+    return bias_idx
 
 
 def main():
     env_cfg, _ = resolve_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+
+    if args_cli.implicit_actuator:
+        print("[INFO]: --implicit_actuator: replacing PACE actuator with ImplicitActuatorCfg "
+              "(matches replay_pace_traj.py drive mode; PACE physics params will be skipped).")
+        env_cfg.scene.robot = env_cfg.scene.robot.replace(
+            actuators={
+                "motors": ImplicitActuatorCfg(
+                    joint_names_expr=["T_motor", "L_motor", "R_motor"],
+                    effort_limit_sim=1000.0,
+                    stiffness=5.0,
+                    damping=0.2,
+                )
+            }
+        )
 
     with launch_simulation(env_cfg, args_cli):
         env_cfg.scene.num_envs = 1
@@ -149,14 +171,29 @@ def main():
             device=device,
         )
 
+        # ── diagnostic: verify joint order and param sanity ───────────────────
+        n = len(joint_order)
+        print(f"[DEBUG]: articulation.joint_names = {articulation.joint_names}")
+        print(f"[DEBUG]: joint_order = {joint_order}")
+        print(f"[DEBUG]: sim_joint_ids = {sim_joint_ids.tolist()}")
+        print(f"[DEBUG]: armature        = {mean[:n].tolist()}")
+        print(f"[DEBUG]: static_friction = {mean[n:2*n].tolist()}")
+        print(f"[DEBUG]: viscous_fric    = {mean[2*n:3*n].tolist()}")
+        print(f"[DEBUG]: encoder_bias    = {mean[3*n:4*n].tolist()}")
+        print(f"[DEBUG]: delay_steps     = {mean[4*n].item():.3f}")
+
         # ── set up simulator with best-fit params ─────────────────────────────
         initial_dof_pos = measured_dof_pos[0].unsqueeze(0)  # [1, n_joints]
         sim_params = mean.unsqueeze(0)                       # [1, n_params]
 
         num_warmup_steps = 50
 
+        # Warmup: env.reset() sets q_j/q_i to USD defaults (typically ~0 rad for the motors).
+        # Running warmup steps with targets = measured_dof_pos[0] lets the PD controller
+        # pull all joints naturally from their reset positions to the desired start positions.
         env.reset()
-        apply_params(articulation, sim_joint_ids, sim_params, initial_dof_pos, device)
+        if not args_cli.implicit_actuator:
+            apply_params(articulation, sim_joint_ids, sim_params, device)
         for _ in range(num_warmup_steps):
             env.step(initial_dof_pos)
 
@@ -173,10 +210,10 @@ def main():
 
         sim_dof_pos = torch.stack(sim_dof_pos_list, dim=0)  # [T, n_joints]
 
-        # encoder bias for display correction
+        # encoder bias for display correction (zero when using implicit actuator)
         n = len(joint_order)
         bias_idx = slice(3 * n, 4 * n)
-        encoder_bias = mean[bias_idx].cpu()
+        encoder_bias = mean[bias_idx].cpu() if not args_cli.implicit_actuator else torch.zeros(n)
 
         env.close()
 

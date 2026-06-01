@@ -34,7 +34,7 @@ from pace_sim2real.utils import project_root  # noqa: E402
 
 
 def main():
-    env_cfg, _ = resolve_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+    env_cfg, _ = resolve_task_config(args_cli.task, "env_cfg_entry_point")
 
     with launch_simulation(env_cfg, args_cli):
         env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -82,6 +82,8 @@ def main():
         num_warmup_steps = 50
 
         def warmup(warmup_actions: torch.Tensor) -> None:
+            # env.reset() sets q_j/q_i to USD defaults; warmup lets the PD pull all joints
+            # to the desired start position before the trajectory replay begins.
             for _ in range(num_warmup_steps):
                 env.step(warmup_actions)
 

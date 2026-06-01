@@ -60,7 +60,7 @@ def main():
     out_path = args.out if args.out is not None else root / _DEFAULT_OUT
 
     print(f"[INFO] Reading CSV:   {csv_path}")
-    data = parse_delta_csv(csv_path)
+    data = parse_delta_csv(csv_path, invert_dofs=[])  # invert_T=true in the hw interface already maps T_motor to Kamino convention
 
     T = data["time"].shape[0]
     duration = data["time"][-1].item()
