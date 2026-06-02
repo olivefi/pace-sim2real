@@ -19,7 +19,7 @@ from isaaclab_tasks.utils import (
 # add argparse arguments
 parser = argparse.ArgumentParser(description="PACE fitting agent for Isaac Lab environments.")
 parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments (= CMA-ES population size).")
-parser.add_argument("--task", type=str, default="Isaac-Pace-Anymal-D-v0", help="Name of the task.")
+parser.add_argument("--task", type=str, default="Isaac-Pace-Delta-v1", help="Name of the task.")
 add_launcher_args(parser)
 args_cli, hydra_args = setup_preset_cli(parser)
 sys.argv = [sys.argv[0]] + fold_preset_tokens(hydra_args)
