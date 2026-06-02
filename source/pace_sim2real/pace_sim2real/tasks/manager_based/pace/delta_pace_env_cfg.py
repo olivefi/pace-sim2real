@@ -41,7 +41,7 @@ class DeltaPacePhysicsCfg(PresetCfg):
 
     default: NewtonCfg = NewtonCfg(
         solver_cfg=KaminoSolverCfg(
-            use_fk_solver=False,
+            use_fk_solver=True,
             use_collision_detector=True,
             collision_detector_pipeline="primitive",
             collision_detector_max_contacts_per_pair=32,
@@ -68,15 +68,17 @@ class DeltaPacePhysicsCfg(PresetCfg):
 
 DELTA_MOTOR_PACE_CFG = PaceDCMotorCfg(
     joint_names_expr=["T_motor", "L_motor", "R_motor"],
-    saturation_effort=20.0,
-    effort_limit=10.0,
-    velocity_limit=20.0,
-    stiffness=5.0,
-    damping=0.2,
-    encoder_bias=0.0,
-    friction=0.0,
+    saturation_effort=72.0,
+    effort_limit=24.0,
+    velocity_limit=10.2,
+    stiffness=10.0,
+    damping=0.6,
+    armature={"T_motor": 0.004646859131753445, "L_motor": 0.0026471856981515884, "R_motor": 0.0020389475394040346},
+    encoder_bias={"T_motor": -0.0968833938241005, "L_motor": 0.08114583045244217, "R_motor": -0.09988974779844284},
+    static_friction={"T_motor": 0.12631875276565552, "L_motor": 0.19694572687149048, "R_motor": 0.23114562034606934},
+    friction={"T_motor": 0.12631875276565552, "L_motor": 0.19694572687149048, "R_motor": 0.23114562034606934},
     dynamic_friction=0.0,
-    viscous_friction=0.0,
+    viscous_friction={"T_motor": 0.22501671314239502, "L_motor": 0.49616193771362305, "R_motor": 0.5104018449783325},
     max_delay=2,
 )
 """PaceDCMotorCfg for the three delta robot motors.
@@ -98,15 +100,13 @@ class DeltaPaceSceneCfg(PaceSim2realSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot",
         actuators={
             "motors": DELTA_MOTOR_PACE_CFG,
+            "bearings": ImplicitActuatorCfg(
+                joint_names_expr=[".*bearing.*"],
+                effort_limit_sim=1000.0,
+                stiffness=0.0,
+                damping=0.0,
+            ),
         },
-        # actuators={
-        #     "motors": ImplicitActuatorCfg(
-        #         joint_names_expr=["T_motor", "L_motor", "R_motor"],
-        #         effort_limit_sim=1000.0,
-        #         stiffness=5.0,
-        #         damping=0.2,
-        #     ),
-        # },
     )
 
 
@@ -132,17 +132,22 @@ class DeltaPaceCfg(PaceCfg):
     robot_name: str = "delta_robot"
     data_dir: str = "delta_robot/chirp_data.pt"
     joint_order: list[str] = ["T_motor", "L_motor", "R_motor"]
+    # extra_joint_order: list[str] = [".*bearing.*"]
     bounds_params: torch.Tensor = torch.zeros((_N_JOINTS * 4 + 1, 2))
+    # extra_bounds_params: torch.Tensor = torch.tensor([
+    #     [1e-7, 1e-4],  # armature [1e-5, 0.01] kg⋅m²
+    #     [0.0, 2.0],    # friction [0, 2]
+    # ])
 
     def __post_init__(self):
         n = _N_JOINTS
         self.bounds_params[:n, 0] = 1e-5
-        self.bounds_params[:n, 1] = 0.01        # armature [1e-5, 0.01] kg⋅m²
+        self.bounds_params[:n, 1] = 1e-1        # armature kg⋅m²
         self.bounds_params[n : 2 * n, 1] = 2.0  # viscous damping [0, 2] Nm⋅s/rad
         self.bounds_params[2 * n : 3 * n, 1] = 2.0  # friction [0, 0.5] Nm
         self.bounds_params[3 * n : 4 * n, 0] = -0.1
         self.bounds_params[3 * n : 4 * n, 1] = 0.1  # bias [-0.1, 0.1] rad
-        self.bounds_params[4 * n, 1] = 2.0     # delay [0, 2] sim steps
+        self.bounds_params[4 * n, 1] = 2.0     # delay [0, 1] sim steps
 
 @configclass
 class DeltaActionsCfg:

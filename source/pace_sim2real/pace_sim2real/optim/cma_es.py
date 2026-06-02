@@ -12,9 +12,34 @@ import os
 
 
 class CMAESOptimizer:
-    def __init__(self, bounds, population_size, log_dir, joint_order, max_iteration, data, device, epsilon=None, sigma=0.5, save_interval=10, save_optimization_process=False):
+    def __init__(self, bounds, population_size, log_dir, joint_order, max_iteration, data, device, epsilon=None, sigma=0.5, save_interval=10, save_optimization_process=False, extra_joint_order=None):
+        """Initialize the CMA-ES optimizer.
+
+        Args:
+            bounds: Parameter bounds tensor of shape ``(num_params, 2)`` for the
+                actuated joints (and the global delay).  When *extra_joint_order*
+                is provided the caller must append the extra-joint bounds before
+                passing; this tensor therefore already includes those rows.
+            population_size: Number of parallel environments (= CMA-ES population).
+            log_dir: Directory for Tensorboard logs and checkpoints.
+            joint_order: Names of the *actuated* joints whose positions are
+                compared against real data for scoring.
+            max_iteration: Maximum number of CMA-ES evolution steps.
+            data: Dict with keys ``"dof_pos"``, ``"des_dof_pos"``, ``"time"``
+                from the real-hardware recording.
+            device: Torch device string.
+            epsilon: Early-stopping threshold on the relative score spread.
+            sigma: Initial CMA-ES step size.
+            save_interval: Checkpoint frequency in iterations.
+            save_optimization_process: If True, save the full parameter and score
+                history to disk when optimisation finishes.
+            extra_joint_order: Names of *passive* joints (e.g. bearings) whose
+                armature and friction are optimised but which do not contribute
+                to the score because no real measurements exist for them.
+        """
 
         self.joint_order = joint_order
+        self.extra_joint_order = extra_joint_order or []
         self.max_iteration = max_iteration
         self.epsilon = epsilon
         self.save_interval = save_interval
@@ -30,6 +55,7 @@ class CMAESOptimizer:
         self.writer = TensorboardSummaryWriter(log_dir=log_dir)
         torch.save({"bounds": bounds,
                     "joint_order": joint_order,
+                    "extra_joint_order": self.extra_joint_order,
                     "dof_pos": data["dof_pos"],
                     "des_dof_pos": data["des_dof_pos"],
                     "time": data["time"]
@@ -61,6 +87,14 @@ class CMAESOptimizer:
         self.viscous_friction_idx = slice(2 * num_joints, 3 * num_joints)
         self.bias_idx = slice(3 * num_joints, 4 * num_joints)
         self.delay_idx = 4 * num_joints
+
+        # Extra (passive) joint parameters: appended after the delay scalar.
+        # Each extra joint gets an armature and a friction coefficient.
+        # These params are applied to the simulator but never scored.
+        num_extra = len(self.extra_joint_order)
+        _base = 4 * num_joints + 1
+        self.extra_armature_idx = slice(_base, _base + num_extra)
+        self.extra_friction_idx = slice(_base + num_extra, _base + 2 * num_extra)
 
         self._reset_population()
         print("CMA-ES optimizer initialized.")
@@ -108,7 +142,16 @@ class CMAESOptimizer:
             self.params[i, :] = torch.tensor(self.optimizer.ask(), device=self.device)
         self.sim_params = self._params_to_sim_params(self.params)
 
-    def update_simulator(self, articulation, joint_ids, initial_position):
+    def update_simulator(self, articulation, joint_ids, initial_position, extra_joint_ids=None):
+        """Write the current CMA-ES population's parameters into the simulator.
+
+        Args:
+            articulation: The Isaac Lab articulation asset.
+            joint_ids: Indices of the actuated joints (scored joints).
+            initial_position: Starting joint positions, shape ``(num_envs, num_joints)``.
+            extra_joint_ids: Indices of the passive/extra joints (not scored).
+                When provided, their armature and friction are written too.
+        """
         env_ids = torch.arange(len(self.sim_params[:, self.armature_idx]), device=self.device)
         articulation.write_joint_armature_to_sim_index(armature=self.sim_params[:, self.armature_idx], joint_ids=joint_ids, env_ids=env_ids)
         articulation.write_joint_friction_coefficient_to_sim_index(joint_friction_coeff=self.sim_params[:, self.viscous_friction_idx], joint_ids=joint_ids, env_ids=env_ids)
@@ -128,6 +171,21 @@ class CMAESOptimizer:
             actuator.update_time_lags(self.sim_params[:, self.delay_idx].to(torch.int))
             actuator.reset(env_ids)
 
+        # Apply armature and friction for passive joints (bearings, etc.).
+        # These joints have no actuator and no real measurements; they affect
+        # the simulation dynamics and are thus optimised indirectly.
+        if extra_joint_ids is not None and len(self.extra_joint_order) > 0:
+            articulation.write_joint_armature_to_sim_index(
+                armature=self.sim_params[:, self.extra_armature_idx],
+                joint_ids=extra_joint_ids,
+                env_ids=env_ids,
+            )
+            articulation.write_joint_friction_coefficient_to_sim_index(
+                joint_friction_coeff=self.sim_params[:, self.extra_friction_idx],
+                joint_ids=extra_joint_ids,
+                env_ids=env_ids,
+            )
+
     def _print_iteration(self):
         min_score = torch.min(self.scores)
         max_score = torch.max(self.scores)
@@ -139,6 +197,9 @@ class CMAESOptimizer:
         print("Viscous Friction: ", self.sim_params[min_index, self.viscous_friction_idx].tolist())
         print("Bias: ", self.sim_params[min_index, self.bias_idx].tolist())
         print("Delay: ", self.sim_params[min_index, self.delay_idx].tolist())
+        if self.extra_joint_order:
+            print("Extra Armature: ", self.sim_params[min_index, self.extra_armature_idx].tolist())
+            print("Extra Friction: ", self.sim_params[min_index, self.extra_friction_idx].tolist())
         print(f"Elapsed time: {(datetime.now() - self._timer_start).total_seconds():.1f} seconds")
         self._timer_start = datetime.now()
         self._log()
@@ -167,6 +228,12 @@ class CMAESOptimizer:
             self.writer.add_scalar("1_Armature/best_" + self.joint_order[i], self.sim_params[min_score_index, self.armature_idx][i].item(), self.iteration_counter)
         self.writer.add_histogram("0_Delay/distribution", self.sim_params[:, self.delay_idx], self.iteration_counter)
         self.writer.add_scalar("0_Delay/best", self.sim_params[min_score_index, self.delay_idx].item(), self.iteration_counter)
+
+        for i, name in enumerate(self.extra_joint_order):
+            self.writer.add_histogram("5_Extra_Armature/distribution_" + name, self.sim_params[:, self.extra_armature_idx][:, i], self.iteration_counter)
+            self.writer.add_histogram("5_Extra_Friction/distribution_" + name, self.sim_params[:, self.extra_friction_idx][:, i], self.iteration_counter)
+            self.writer.add_scalar("5_Extra_Armature/best_" + name, self.sim_params[min_score_index, self.extra_armature_idx][i].item(), self.iteration_counter)
+            self.writer.add_scalar("5_Extra_Friction/best_" + name, self.sim_params[min_score_index, self.extra_friction_idx][i].item(), self.iteration_counter)
 
         self.writer.add_scalar("0_Episode/score", min_score.item(), self.iteration_counter)
         self.writer.add_scalar("0_Episode/max_score", max_score.item(), self.iteration_counter)

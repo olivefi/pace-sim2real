@@ -135,6 +135,18 @@ class PaceCfg:
     joint_order: list = MISSING
     bounds_params: torch.Tensor = MISSING
 
+    # Optional passive joints (e.g. bearings): their armature and friction are
+    # optimised but they carry no real-data measurements, so they do not
+    # contribute to the CMA-ES score directly.  Each entry is a regex pattern
+    # matched against the articulation's joint names at runtime.
+    extra_joint_order: list = []
+    # Per-parameter-type bounds for the extra joints: shape (2, 2).
+    #   Row 0 — armature    [min, max]  [kg⋅m²]
+    #   Row 1 — friction    [min, max]  [Nm·s/rad]
+    # Every matched joint receives the same bounds (tiled at runtime).
+    # Required when extra_joint_order is non-empty; ignored otherwise.
+    extra_bounds_params: torch.Tensor | None = None
+
 ##
 # Environment configuration
 ##

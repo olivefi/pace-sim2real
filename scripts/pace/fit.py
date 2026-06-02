@@ -5,6 +5,7 @@
 """Run the PACE CMA-ES system-identification fitting loop."""
 
 import argparse
+import re
 import sys
 
 from isaaclab_tasks.utils import (
@@ -53,6 +54,31 @@ def main():
             device=env.unwrapped.device,
         )
 
+        # Resolve passive (extra) joints from regex patterns and build their bounds.
+        extra_joint_names: list[str] = []
+        for joint_name in articulation.joint_names:
+            for pattern in env_cfg.sim2real.extra_joint_order:
+                if re.fullmatch(pattern, joint_name):
+                    extra_joint_names.append(joint_name)
+                    break
+
+        extra_joint_ids = None
+        if extra_joint_names:
+            extra_joint_ids = torch.tensor(
+                [articulation.joint_names.index(name) for name in extra_joint_names],
+                device=env.unwrapped.device,
+            )
+            # extra_bounds_params shape (2, 2): row 0 = armature, row 1 = friction.
+            # Tile so each matched joint gets its own row: shape (2*m, 2).
+            per_type = env_cfg.sim2real.extra_bounds_params.to(env.unwrapped.device)
+            m = len(extra_joint_names)
+            extra_bounds = torch.cat([
+                per_type[0:1].expand(m, -1),  # armature for all extra joints
+                per_type[1:2].expand(m, -1),  # friction for all extra joints
+            ], dim=0)
+            bounds_params = torch.cat([bounds_params, extra_bounds], dim=0)
+            print(f"[INFO]: Extra (passive) joints for optimisation: {extra_joint_names}")
+
         data_file = project_root() / "data" / env_cfg.sim2real.data_dir
         log_dir = project_root() / "logs" / "pace" / env_cfg.sim2real.robot_name
 
@@ -77,6 +103,7 @@ def main():
             sigma=env_cfg.sim2real.cmaes.sigma,
             save_interval=env_cfg.sim2real.cmaes.save_interval,
             save_optimization_process=env_cfg.sim2real.cmaes.save_optimization_process,
+            extra_joint_order=extra_joint_names,
         )
 
         num_warmup_steps = 50
@@ -88,7 +115,7 @@ def main():
                 env.step(warmup_actions)
 
         env.reset()
-        opt.update_simulator(articulation, sim_joint_ids, initial_dof_pos)
+        opt.update_simulator(articulation, sim_joint_ids, initial_dof_pos, extra_joint_ids=extra_joint_ids)
         warmup(initial_dof_pos)
 
         iteration_bar = tqdm(total=env_cfg.sim2real.cmaes.max_iteration, desc="CMA-ES", unit="iter")
@@ -114,7 +141,7 @@ def main():
                     if opt.finished():
                         break
                     env.reset()
-                    opt.update_simulator(env.unwrapped.scene["robot"], sim_joint_ids, initial_dof_pos)
+                    opt.update_simulator(env.unwrapped.scene["robot"], sim_joint_ids, initial_dof_pos, extra_joint_ids=extra_joint_ids)
                     warmup(initial_dof_pos)
 
         rollout_bar.close()
