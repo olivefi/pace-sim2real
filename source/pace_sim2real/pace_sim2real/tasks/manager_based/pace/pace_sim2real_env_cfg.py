@@ -53,10 +53,10 @@ class PacePhysicsCfg(PresetCfg):
 class PaceSim2realSceneCfg(InteractiveSceneCfg):
 
     # ground plane
-    ground = AssetBaseCfg(
-        prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
-    )
+    # ground = AssetBaseCfg(
+    #     prim_path="/World/ground",
+    #     spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
+    # )
     env_spacing: float = 2.5
     num_envs: int = 4096
 

@@ -73,12 +73,11 @@ DELTA_MOTOR_PACE_CFG = PaceDCMotorCfg(
     velocity_limit=10.2,
     stiffness=10.0,
     damping=0.6,
-    armature={"T_motor": 0.004646859131753445, "L_motor": 0.0026471856981515884, "R_motor": 0.0020389475394040346},
-    encoder_bias={"T_motor": -0.0968833938241005, "L_motor": 0.08114583045244217, "R_motor": -0.09988974779844284},
-    static_friction={"T_motor": 0.12631875276565552, "L_motor": 0.19694572687149048, "R_motor": 0.23114562034606934},
-    friction={"T_motor": 0.12631875276565552, "L_motor": 0.19694572687149048, "R_motor": 0.23114562034606934},
+    armature={"T_motor": 0.058864057064056396, "L_motor": 0.05848269909620285, "R_motor": 0.05966489762067795},
+    # encoder_bias={"T_motor": -0.044406916946172714, "L_motor": -0.09941181540489197, "R_motor": 0.0989571288228035},
+    static_friction={"T_motor": 0.4040350914001465, "L_motor": 0.3985402584075928, "R_motor": 0.35988008975982666},
+    friction={"T_motor": 0.00045931339263916016, "L_motor": 0.005115866661071777, "R_motor": 0.0007640719413757324},
     dynamic_friction=0.0,
-    viscous_friction={"T_motor": 0.22501671314239502, "L_motor": 0.49616193771362305, "R_motor": 0.5104018449783325},
     max_delay=2,
 )
 """PaceDCMotorCfg for the three delta robot motors.
