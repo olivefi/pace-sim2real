@@ -14,9 +14,8 @@ from isaaclab.utils.configclass import configclass
 from isaaclab_tasks.utils import PresetCfg
 
 from pace_sim2real import PaceCfg, PaceSim2realEnvCfg, PaceSim2realSceneCfg
-from pace_sim2real.utils import PaceDCMotorCfg
 
-from lunarleaper_isaaclab.assets.robots.delta_robot import DELTA_ALLREV_CFG  # isort: skip
+from lunarleaper_isaaclab.assets.robots.delta_robot import DELTA_ALLREV_CFG, DELTA_MOTOR_PACE_CFG  # isort: skip
 from . import mdp
 
 
@@ -60,31 +59,6 @@ class DeltaPacePhysicsCfg(PresetCfg):
         num_substeps=1,
         use_cuda_graph=True,
     )
-
-
-##
-# Actuator
-##
-
-DELTA_MOTOR_PACE_CFG = PaceDCMotorCfg(
-    joint_names_expr=["T_motor", "L_motor", "R_motor"],
-    saturation_effort=72.0,
-    effort_limit=24.0,
-    velocity_limit=10.2,
-    stiffness=10.0,
-    damping=0.6,
-    armature={"T_motor": 0.058864057064056396, "L_motor": 0.05848269909620285, "R_motor": 0.05966489762067795},
-    # encoder_bias={"T_motor": -0.044406916946172714, "L_motor": -0.09941181540489197, "R_motor": 0.0989571288228035},
-    static_friction={"T_motor": 0.4040350914001465, "L_motor": 0.3985402584075928, "R_motor": 0.35988008975982666},
-    friction={"T_motor": 0.00045931339263916016, "L_motor": 0.005115866661071777, "R_motor": 0.0007640719413757324},
-    dynamic_friction=0.0,
-    max_delay=2,
-)
-"""PaceDCMotorCfg for the three delta robot motors.
-
-Stiffness/damping match the RL environment defaults. Friction and bias are set to
-zero as initial conditions; CMA-ES will optimise all of these.
-"""
 
 
 ##
