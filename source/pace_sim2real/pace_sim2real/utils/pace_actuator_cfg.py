@@ -21,4 +21,11 @@ class PaceDCMotorCfg(DCMotorCfg):
     encoder_bias: dict[str, float] | float | None = 0.0
     max_delay: torch.int | None = 0
     static_friction: dict[str, float] | float | None = 0.0
-    """Static friction torque [N·m] applied against the direction of motion. Defaults to 0."""
+    """Static (stiction) friction torque [N·m] applied against the direction of motion when the
+    joint velocity magnitude is below :attr:`static_friction_threshold`. Defaults to 0."""
+    dynamic_friction: dict[str, float] | float | None = 0.0
+    """Dynamic (Coulomb) friction torque [N·m] applied against the direction of motion when the
+    joint velocity magnitude is at or above :attr:`static_friction_threshold`. Defaults to 0."""
+    static_friction_threshold: dict[str, float] | float | None = 0.01
+    """Joint speed [rad/s] below which :attr:`static_friction` is applied instead of
+    :attr:`dynamic_friction`. Defaults to 0.01."""

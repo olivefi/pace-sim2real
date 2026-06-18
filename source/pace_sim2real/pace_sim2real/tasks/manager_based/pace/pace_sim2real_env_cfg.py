@@ -4,27 +4,26 @@
 
 # import math
 from dataclasses import MISSING
-import torch
 
 import isaaclab.sim as sim_utils
+import torch
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+
+# from isaaclab.managers import SceneEntityCfg
 # from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
-# from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.utils.configclass import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-
+from isaaclab.utils.configclass import configclass
 from isaaclab_newton.physics import KaminoSolverCfg, NewtonCfg
 from isaaclab_physx.physics import PhysxCfg
 from isaaclab_tasks.utils import PresetCfg
 
 from . import mdp
-
 
 ##
 # Physics backend
@@ -81,7 +80,10 @@ class PaceSim2realSceneCfg(InteractiveSceneCfg):
 @configclass
 class ActionsCfg:
     """Action specifications for the MDP."""
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=1.0, use_default_offset=False)  # actions = absolute joint position targets
+
+    joint_pos = mdp.JointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], scale=1.0, use_default_offset=False
+    )  # actions = absolute joint position targets
 
 
 @configclass
@@ -91,6 +93,7 @@ class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
+
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         actions = ObsTerm(func=mdp.last_action)
@@ -106,34 +109,50 @@ class ObservationsCfg:
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
+
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
 
 
 @configclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
+
     time_out = DoneTerm(func=mdp.time_out, time_out=False)
 
 
 @configclass
 class CMAESOptimizerCfg:
     """CMA-ES optimizer configuration."""
+
     max_iteration: int = 200
     epsilon: float = 1e-2
     sigma: float = 0.5
     save_interval: int = 10
-    save_optimization_process: bool = False  # consume more disk space if True, saves optimization process after finishing
+    save_optimization_process: bool = (
+        False  # consume more disk space if True, saves optimization process after finishing
+    )
 
 
 @configclass
 class PaceCfg:
     """Overall configuration for Pace Sim2Real task."""
+
     cmaes: CMAESOptimizerCfg = CMAESOptimizerCfg()
 
     robot_name: str = MISSING
     data_dir: str = MISSING
     joint_order: list = MISSING
     bounds_params: torch.Tensor = MISSING
+
+    # Optional decomposition into independent per-group CMA-ES processes. Each
+    # entry lists the indices (into joint_order) of the joints belonging to one
+    # group, and the population (= num_envs) is split evenly across the groups.
+    # When None (default) a single CMA-ES optimises all joints jointly. Splitting
+    # a high-dimensional fit (e.g. a 12-joint quadruped) into low-dimensional
+    # per-leg fits dramatically speeds up CMA-ES convergence; it is only valid
+    # when the groups are dynamically independent (e.g. a fixed-base robot whose
+    # legs do not interact). See :class:`~pace_sim2real.CMAESOptimizer`.
+    joint_groups: list | None = None
 
     # Optional passive joints (e.g. bearings): their armature and friction are
     # optimised but they carry no real-data measurements, so they do not
@@ -146,6 +165,7 @@ class PaceCfg:
     # Every matched joint receives the same bounds (tiled at runtime).
     # Required when extra_joint_order is non-empty; ignored otherwise.
     extra_bounds_params: torch.Tensor | None = None
+
 
 ##
 # Environment configuration

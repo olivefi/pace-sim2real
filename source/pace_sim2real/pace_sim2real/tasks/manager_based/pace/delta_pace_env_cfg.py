@@ -94,19 +94,20 @@ _N_JOINTS = 3  # motor1, motor2, motor3
 class DeltaPaceCfg(PaceCfg):
     """PACE optimisation configuration for the delta robot.
 
-    Parameter layout (13 total):
+    Parameter layout (16 total):
         [0:3]   armature          [kg⋅m²]
         [3:6]   viscous damping   [Nm⋅s/rad]
-        [6:9]   static/dynamic friction  [Nm]
-        [9:12]  encoder bias      [rad]
-        [12]    action delay      [sim steps]
+        [6:9]   static friction   [Nm]
+        [9:12]  dynamic friction  [Nm]
+        [12:15] encoder bias      [rad]
+        [15]    action delay      [sim steps]
     """
 
     robot_name: str = "delta_robot"
     data_dir: str = "delta_robot/chirp_data.pt"
     joint_order: list[str] = ["T_motor", "L_motor", "R_motor"]
     # extra_joint_order: list[str] = [".*bearing.*"]
-    bounds_params: torch.Tensor = torch.zeros((_N_JOINTS * 4 + 1, 2))
+    bounds_params: torch.Tensor = torch.zeros((_N_JOINTS * 5 + 1, 2))
     # extra_bounds_params: torch.Tensor = torch.tensor([
     #     [1e-7, 1e-4],  # armature [1e-5, 0.01] kg⋅m²
     #     [0.0, 2.0],    # friction [0, 2]
@@ -117,10 +118,11 @@ class DeltaPaceCfg(PaceCfg):
         self.bounds_params[:n, 0] = 1e-5
         self.bounds_params[:n, 1] = 1e-1        # armature kg⋅m²
         self.bounds_params[n : 2 * n, 1] = 2.0  # viscous damping [0, 2] Nm⋅s/rad
-        self.bounds_params[2 * n : 3 * n, 1] = 2.0  # friction [0, 0.5] Nm
-        self.bounds_params[3 * n : 4 * n, 0] = -0.1
-        self.bounds_params[3 * n : 4 * n, 1] = 0.1  # bias [-0.1, 0.1] rad
-        self.bounds_params[4 * n, 1] = 2.0     # delay [0, 1] sim steps
+        self.bounds_params[2 * n : 3 * n, 1] = 2.0  # static friction [0, 2] Nm
+        self.bounds_params[3 * n : 4 * n, 1] = 2.0  # dynamic friction [0, 2] Nm
+        self.bounds_params[4 * n : 5 * n, 0] = -0.1
+        self.bounds_params[4 * n : 5 * n, 1] = 0.1  # bias [-0.1, 0.1] rad
+        self.bounds_params[5 * n, 1] = 2.0     # delay [0, 1] sim steps
 
 @configclass
 class DeltaActionsCfg:

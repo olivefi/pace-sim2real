@@ -6,13 +6,14 @@
 Utility functions and actuator models for PACE.
 """
 
-from .pace_actuator_cfg import PaceDCMotorCfg
+from .csv_parser import parse_delta_csv, parse_delta_quadruped_csv
 from .pace_actuator import PaceDCMotor
+from .pace_actuator_cfg import PaceDCMotorCfg
 from .paths import project_root
-from .csv_parser import parse_delta_csv
 
 __all__ = [
     "PaceDCMotorCfg",
     "PaceDCMotor",
     "parse_delta_csv",
+    "parse_delta_quadruped_csv",
 ]
