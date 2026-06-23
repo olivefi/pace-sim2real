@@ -8,7 +8,7 @@
 # Licensed under the Apache License 2.0
 
 import torch
-from isaaclab_newton.physics import KaminoSolverCfg, NewtonCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators.actuator_pd_cfg import ImplicitActuatorCfg
@@ -31,30 +31,30 @@ from lunarleaper_isaaclab.assets.robots.lunarleaper_delta import (  # isort: ski
 
 
 ##
-# Physics backend — Kamino only (required for closed kinematic loops in the delta legs)
+# Physics backend
 ##
 
 
 @configclass
 class DeltaQuadrupedPacePhysicsCfg(PresetCfg):
-    """Kamino-only physics preset for the delta-legged quadruped.
+    """MuJoCo-Warp physics preset for the delta-legged quadruped PACE environment.
 
-    Each leg's parallel-arm topology contains PhysicsSphericalJoint loop-closing
-    constraints that PhysX cannot handle, so Kamino is required. The solver
-    settings are kept identical to the training preset
-    (``LunarleaperDeltaPhysicsCfg`` in ``delta_velocity_env_cfg``) so that the
-    actuator parameters fitted here are valid for the dynamics seen at training
-    time: ``unified`` collision pipeline, two solver substeps, default P-ADMM
-    tolerances, and a 0.01 contact margin (set in :meth:`__post_init__`).
+    Identical to the training preset (``LunarleaperDeltaPhysicsCfg`` in
+    ``delta_velocity_env_cfg``) so that the actuator parameters fitted here are
+    valid for the dynamics seen at training time. MuJoCo-Warp handles the delta
+    leg's closed kinematic loops via equality constraints and applies joint
+    ``frictionloss`` correctly for closed-loop bodies (unlike Kamino, where
+    sim-side dry friction could break loop-closure settlement).
     """
 
     default: NewtonCfg = NewtonCfg(
-        solver_cfg=KaminoSolverCfg(
-            use_fk_solver=True,
-            use_collision_detector=True,
-            collision_detector_pipeline="unified",
+        solver_cfg=MJWarpSolverCfg(
+            use_mujoco_contacts=False,
+            tolerance=1e-8,
+            iterations=200,
+            integrator="implicitfast",
         ),
-        num_substeps=2,
+        num_substeps=8,
         use_cuda_graph=True,
     )
 
@@ -76,7 +76,16 @@ class DeltaQuadrupedPaceSceneCfg(PaceSim2realSceneCfg):
             # must be >= the delay upper bound (7) the optimiser samples, else
             # update_time_lags raises when CMA-ES proposes a large delay. The base
             # actuator cfg ships max_delay=4, so bump it here.
-            "motors": DELTA_QUADRUPED_MOTOR_PACE_CFG.replace(max_delay=7),
+            # apply_coulomb_friction=False: MuJoCo-Warp applies Coulomb (dry) friction
+            # natively via dof_frictionloss (PACE optimiser's friction block, slot 1).
+            # apply_viscous_friction=True: velocity-proportional friction is NOT exposed
+            # as per-env dof_damping by Newton, so the actuator applies it instead using
+            # the static_friction coefficient (PACE optimiser's slot 2, [N·m·s/rad]).
+            "motors": DELTA_QUADRUPED_MOTOR_PACE_CFG.replace(
+                max_delay=7,
+                apply_coulomb_friction=False,
+                apply_viscous_friction=True,
+            ),
             "bearings": ImplicitActuatorCfg(
                 joint_names_expr=[".*bearing.*"],
                 effort_limit_sim=1000.0,
@@ -127,12 +136,18 @@ class DeltaQuadrupedPaceCfg(PaceCfg):
     """PACE optimisation configuration for the delta-legged quadruped.
 
     Parameter layout (61 total):
-        [0:12]   armature          [kg⋅m²]
-        [12:24]  viscous damping   [Nm⋅s/rad]
-        [24:36]  static friction   [Nm]
-        [36:48]  dynamic friction  [Nm]
-        [48:60]  encoder bias      [rad]
-        [60]     action delay      [sim steps]
+        [0:12]   armature        [kg⋅m²]     → written to dof_armature
+        [12:24]  Coulomb friction [Nm]        → written to dof_frictionloss (MuJoCo Coulomb)
+        [24:36]  viscous friction [Nm·s/rad]  → actuator: ``-viscous * vel`` (apply_viscous_friction=True)
+        [36:48]  (unused)                     → zeroed; slot kept for CMA-ES layout compat
+        [48:60]  encoder bias    [rad]        → actuator encoder offset
+        [60]     action delay    [sim steps]
+
+    Slot 1 (Coulomb) is written to ``dof_frictionloss`` via
+    :meth:`~isaaclab.assets.Articulation.write_joint_friction_coefficient_to_sim_index`.
+    Slot 2 (viscous) cannot be written to ``dof_damping`` per-environment via the Newton
+    API (``write_joint_damping_to_sim_index`` targets the actuator PD ``kd``, not the
+    intrinsic joint damping), so the actuator applies it as ``-viscous * vel`` instead.
 
     The optimisation is split into four independent CMA-ES processes (one per
     leg) via :attr:`joint_groups`; see :class:`~pace_sim2real.CMAESOptimizer`.
@@ -148,9 +163,9 @@ class DeltaQuadrupedPaceCfg(PaceCfg):
         n = _N_JOINTS
         self.bounds_params[:n, 0] = 1e-3
         self.bounds_params[:n, 1] = 1e-0  # armature [1e-3, 1.0] kg⋅m²
-        self.bounds_params[n : 2 * n, 1] = 0.1  # viscous damping [0, 0.1] Nm⋅s/rad
-        self.bounds_params[2 * n : 3 * n, 1] = 5.0  # static friction [0, 5] Nm
-        self.bounds_params[3 * n : 4 * n, 1] = 5.0  # dynamic friction [0, 5] Nm
+        self.bounds_params[n : 2 * n, 1] = 5.0  # Coulomb → dof_frictionloss [0, 5] Nm
+        self.bounds_params[2 * n : 3 * n, 1] = 2.0  # viscous → actuator [0, 2] Nm·s/rad
+        self.bounds_params[3 * n : 4 * n, :] = 0.0  # slot 3 unused: fixed at 0
         self.bounds_params[4 * n : 5 * n, 0] = -0.03
         self.bounds_params[4 * n : 5 * n, 1] = 0.03  # bias [-0.03, 0.03] rad
         self.bounds_params[5 * n, 1] = 7.0  # delay [0, 7] sim steps
@@ -235,10 +250,6 @@ class DeltaQuadrupedPaceEnvCfg(PaceSim2realEnvCfg):
         self.sim.dt = 0.005
         self.decimation = 1
 
-        # Kamino-only physics, matched to the training preset
+        # MuJoCo-Warp physics, matched to the training preset
         # (LunarleaperDeltaPhysicsCfg in delta_velocity_env_cfg).
         self.sim.physics = DeltaQuadrupedPacePhysicsCfg()
-        # A nonzero collision margin is required for stable contact on the
-        # triangle-mesh terrain at training time; kept here so the solver setup
-        # is identical to training.
-        self.sim.physics.default.default_shape_cfg.margin = 0.01

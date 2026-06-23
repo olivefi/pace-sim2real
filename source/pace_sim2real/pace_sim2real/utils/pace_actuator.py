@@ -4,29 +4,35 @@
 
 from __future__ import annotations
 
-import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import torch
 from isaaclab.actuators import DCMotor
-from isaaclab.utils.types import ArticulationActions
 from isaaclab.utils import DelayBuffer
+from isaaclab.utils.types import ArticulationActions
+
 if TYPE_CHECKING:
     # only for type checking
     from .pace_actuator_cfg import PaceDCMotorCfg
 
 
 class PaceDCMotor(DCMotor):
-    """Pace DC Motor actuator model with encoder bias and action delay.
+    """DC motor actuator model with per-joint encoder bias, friction, and action delay.
 
-    The actuator models a DC motor whose controller receives joint positions in the encoder
-    frame by adding a per-joint encoder bias to the true joint positions. In other words,
-    the controller operates on biased (encoder) positions rather than the true joint positions.
+    The controller receives joint positions in the encoder frame (true position minus bias).
+    The commanded position targets are pushed through a delay buffer to model command latency.
 
-    The position targets fed to the PD controller are applied after a configurable delay
-    (in simulation steps) to represent latency between command calculation and actuation.
+    The actuator applies a velocity-dependent friction torque against the direction of motion:
+    static (stiction) friction below :attr:`static_friction_threshold` and dynamic (Coulomb)
+    friction at or above it. This is separate from the physical joint-friction coefficient.
 
     The software implementation is inspired by DelayedPDActuator.
+
+    .. note::
+        This implementation is kept in sync with
+        ``lunarleaper_isaaclab.assets.actuators.pace_dc_motor.PaceDCMotor``; changes here
+        should be mirrored there (and vice versa).
     """
 
     cfg: PaceDCMotorCfg
@@ -43,9 +49,13 @@ class PaceDCMotor(DCMotor):
         self.static_friction = self._parse_joint_parameter(cfg.static_friction, 0.0)
         self.dynamic_friction = self._parse_joint_parameter(cfg.dynamic_friction, 0.0)
         self.static_friction_threshold = self._parse_joint_parameter(cfg.static_friction_threshold, 0.01)
+        self.apply_coulomb_friction: bool = cfg.apply_coulomb_friction
+        self.apply_viscous_friction: bool = cfg.apply_viscous_friction
 
         self.position_targets_delay_buffer = DelayBuffer(cfg.max_delay + 1, self._num_envs, device=self._device)
-        self.position_targets_delay_buffer.set_time_lag(cfg.max_delay, torch.arange(self._num_envs, device=self._device))
+        self.position_targets_delay_buffer.set_time_lag(
+            cfg.max_delay, torch.arange(self._num_envs, device=self._device)
+        )
 
     def reset(self, env_ids: Sequence[int]):
         super().reset(env_ids)
@@ -74,12 +84,18 @@ class PaceDCMotor(DCMotor):
             control_action.joint_positions = self.position_targets_delay_buffer.compute(control_action.joint_positions)
         # compute actuator model with encoder bias added to joint positions (joint position in encoder frame, not simulation frame)
         control_action_sim = super().compute(control_action, joint_pos - self.encoder_bias, joint_vel)
-        if control_action_sim.joint_efforts is not None:
+        if control_action_sim.joint_efforts is not None and self.apply_coulomb_friction:
             # Stiction below the threshold speed, Coulomb (dynamic) friction at or above it.
+            # Disabled when the physics backend applies dry friction natively via joint
+            # frictionloss (e.g. MuJoCo-Warp), to avoid double-counting.
             friction = torch.where(
                 torch.abs(joint_vel) < self.static_friction_threshold,
                 self.static_friction,
                 self.dynamic_friction,
             )
             control_action_sim.joint_efforts -= friction * torch.sign(joint_vel)
+        if control_action_sim.joint_efforts is not None and self.apply_viscous_friction:
+            # Velocity-proportional (viscous) friction. static_friction holds the fitted
+            # viscous coefficient [N·m·s/rad] when apply_coulomb_friction=False.
+            control_action_sim.joint_efforts -= self.static_friction * joint_vel
         return control_action_sim
