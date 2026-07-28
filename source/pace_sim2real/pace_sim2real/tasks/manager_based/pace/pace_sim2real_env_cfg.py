@@ -154,6 +154,20 @@ class PaceCfg:
     # legs do not interact). See :class:`~pace_sim2real.CMAESOptimizer`.
     joint_groups: list | None = None
 
+    # Fit the per-motor encoder bias. When False the bias block is dropped from
+    # the CMA-ES search vector (its bounds should then be pinned to [0, 0]).
+    fit_bias: bool = True
+
+    # Fit the per-motor gearbox play. Requires an asset whose motors are split by
+    # a passive ``*_backlash`` joint (built with ``backlash_limit_rad``); the
+    # fitted value is that joint's total play band [rad], written as +/-band/2
+    # position limits. ``bounds_params`` must then carry one extra per-joint block
+    # after the delay scalar. Note the hardware encoders are motor-side, so the
+    # play is only weakly observable in a chirp — through the load the motor sees
+    # engaged versus free — not as a direct position offset.
+    fit_backlash: bool = False
+
+
     # Optional passive joints (e.g. bearings): their armature and friction are
     # optimised but they carry no real-data measurements, so they do not
     # contribute to the CMA-ES score directly.  Each entry is a regex pattern

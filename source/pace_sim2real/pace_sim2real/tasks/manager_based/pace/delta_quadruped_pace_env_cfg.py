@@ -7,19 +7,17 @@
 # Author: Filip Bjelonic
 # Licensed under the Apache License 2.0
 
-import torch
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
-
 import isaaclab.sim as sim_utils
+import torch
 from isaaclab.actuators.actuator_pd_cfg import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
-
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 from isaaclab_tasks.utils import PresetCfg
-
 from pace_sim2real import PaceCfg, PaceSim2realEnvCfg, PaceSim2realSceneCfg
 
 from . import mdp
@@ -27,6 +25,7 @@ from . import mdp
 from lunarleaper_isaaclab.assets.robots.lunarleaper_delta import (  # isort: skip
     DELTA_QUADRUPED_MOTOR_PACE_CFG,
     LUNARLEAPER_ALU_DELTA_CFG,
+    LUNARLEAPER_ALU_DELTA_MEDIUM_BACKLASH_NOFOOT_CFG,
 )
 
 
@@ -51,10 +50,11 @@ class DeltaQuadrupedPacePhysicsCfg(PresetCfg):
         solver_cfg=MJWarpSolverCfg(
             use_mujoco_contacts=False,
             tolerance=1e-8,
-            iterations=200,
+            iterations=250,
+            ls_iterations=100,
             integrator="implicitfast",
         ),
-        num_substeps=8,
+        num_substeps=1,
         use_cuda_graph=True,
     )
 
@@ -72,20 +72,10 @@ class DeltaQuadrupedPaceSceneCfg(PaceSim2realSceneCfg):
     robot: ArticulationCfg = LUNARLEAPER_ALU_DELTA_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Robot",
         actuators={
-            # max_delay sizes the torque delay buffer (history = max_delay + 1); it
-            # must be >= the delay upper bound (7) the optimiser samples, else
-            # update_time_lags raises when CMA-ES proposes a large delay. The base
-            # actuator cfg ships max_delay=4, so bump it here.
-            # apply_coulomb_friction=False: MuJoCo-Warp applies Coulomb (dry) friction
-            # natively via dof_frictionloss (PACE optimiser's friction block, slot 1).
-            # apply_viscous_friction=True: velocity-proportional friction is NOT exposed
-            # as per-env dof_damping by Newton, so the actuator applies it instead using
-            # the static_friction coefficient (PACE optimiser's slot 2, [N·m·s/rad]).
-            "motors": DELTA_QUADRUPED_MOTOR_PACE_CFG.replace(
-                max_delay=7,
-                apply_coulomb_friction=False,
-                apply_viscous_friction=True,
-            ),
+            # max_delay sizes the command delay buffer (history = max_delay + 1); it must be
+            # >= the delay upper bound (7) the optimiser samples, else update_time_lags
+            # raises when CMA-ES proposes a large delay. The base cfg ships max_delay=4.
+            "motors": DELTA_QUADRUPED_MOTOR_PACE_CFG.replace(max_delay=7),
             "bearings": ImplicitActuatorCfg(
                 joint_names_expr=[".*bearing.*"],
                 effort_limit_sim=1000.0,
@@ -130,45 +120,55 @@ _JOINT_GROUPS: list[list[int]] = [
     [9, 10, 11],  # RH
 ]
 
+# Upper bound [rad] of the fitted total gear-play band (see ``fit_backlash``).
+_BACKLASH_BAND_MAX: float = 0.05
+
 
 @configclass
 class DeltaQuadrupedPaceCfg(PaceCfg):
     """PACE optimisation configuration for the delta-legged quadruped.
 
-    Parameter layout (61 total):
-        [0:12]   armature        [kg⋅m²]     → written to dof_armature
-        [12:24]  Coulomb friction [Nm]        → written to dof_frictionloss (MuJoCo Coulomb)
-        [24:36]  viscous friction [Nm·s/rad]  → actuator: ``-viscous * vel`` (apply_viscous_friction=True)
-        [36:48]  (unused)                     → zeroed; slot kept for CMA-ES layout compat
-        [48:60]  encoder bias    [rad]        → actuator encoder offset
-        [60]     action delay    [sim steps]
+    Parameter layout (49 without gear play, 61 with):
+        [0:12]   armature          [kg⋅m²]      → ``dof_armature``
+        [12:24]  Coulomb friction  [N·m]        → ``dof_frictionloss`` (dry friction)
+        [24:36]  viscous damping   [N·m·s/rad]  → ``dof_damping`` (integrated implicitly)
+        [36:48]  encoder bias      [rad]        → actuator encoder offset
+        [48]     action delay      [sim steps]  → actuator delay buffer (per environment)
+        [49:61]  gear-play band    [rad]        → ``*_backlash`` joint limits (±band/2),
+                                                  present only when :attr:`fit_backlash`
 
-    Slot 1 (Coulomb) is written to ``dof_frictionloss`` via
-    :meth:`~isaaclab.assets.Articulation.write_joint_friction_coefficient_to_sim_index`.
-    Slot 2 (viscous) cannot be written to ``dof_damping`` per-environment via the Newton
-    API (``write_joint_damping_to_sim_index`` targets the actuator PD ``kd``, not the
-    intrinsic joint damping), so the actuator applies it as ``-viscous * vel`` instead.
-
-    The optimisation is split into four independent CMA-ES processes (one per
-    leg) via :attr:`joint_groups`; see :class:`~pace_sim2real.CMAESOptimizer`.
+    Every physical block is a solver-side joint property; the actuator only applies the
+    encoder bias and the command delay. The optimisation is split into four independent
+    CMA-ES processes (one per leg) via :attr:`joint_groups`; see
+    :class:`~pace_sim2real.CMAESOptimizer`.
     """
 
     robot_name: str = "delta_quadruped"
     data_dir: str = "delta_quadruped/chirp_data.pt"
     joint_order: list[str] = _JOINT_ORDER
     joint_groups: list[list[int]] = _JOINT_GROUPS
-    bounds_params: torch.Tensor = torch.zeros((_N_JOINTS * 5 + 1, 2))
+    bounds_params: torch.Tensor = torch.zeros((_N_JOINTS * 4 + 1, 2))
 
     def __post_init__(self):
         n = _N_JOINTS
-        self.bounds_params[:n, 0] = 1e-3
-        self.bounds_params[:n, 1] = 1e-0  # armature [1e-3, 1.0] kg⋅m²
-        self.bounds_params[n : 2 * n, 1] = 5.0  # Coulomb → dof_frictionloss [0, 5] Nm
-        self.bounds_params[2 * n : 3 * n, 1] = 2.0  # viscous → actuator [0, 2] Nm·s/rad
-        self.bounds_params[3 * n : 4 * n, :] = 0.0  # slot 3 unused: fixed at 0
-        self.bounds_params[4 * n : 5 * n, 0] = -0.03
-        self.bounds_params[4 * n : 5 * n, 1] = 0.03  # bias [-0.03, 0.03] rad
-        self.bounds_params[5 * n, 1] = 7.0  # delay [0, 7] sim steps
+        # Rebuilt from scratch (rather than mutated in place) so the class-level default
+        # tensor is never shared/edited across cfg instances, and so the optional backlash
+        # block can change the length.
+        num_params = n * 5 + 1 if self.fit_backlash else n * 4 + 1
+        bounds = torch.zeros((num_params, 2))
+        bounds[:n, 0] = 1e-2
+        bounds[:n, 1] = 1e-0  # armature [1e-2, 1.0] kg⋅m²
+        bounds[n : 2 * n, 1] = 5.0  # Coulomb friction [0, 5] N·m
+        bounds[2 * n : 3 * n, 1] = 2.0  # viscous damping [0, 2] N·m·s/rad
+        bounds[3 * n : 4 * n, 0] = -0.03
+        bounds[3 * n : 4 * n, 1] = 0.03  # bias [-0.03, 0.03] rad
+        bounds[4 * n, 1] = 7.0  # delay [0, 7] sim steps
+        if self.fit_backlash:
+            # Total gear-play band [rad] per motor, applied as ±band/2 limits on the
+            # ``*_backlash`` joints. Spans the training-time DR range with headroom;
+            # 0 = a rigid transmission.
+            bounds[4 * n + 1 : 5 * n + 1, 1] = _BACKLASH_BAND_MAX
+        self.bounds_params = bounds
 
 
 @configclass
@@ -215,6 +215,35 @@ class DeltaQuadrupedObservationsCfg:
     policy: PolicyCfg = PolicyCfg()
 
 
+# Height [m] at which the body centre is pinned, matching the aluminium quadruped's
+# spawn height (``_ALU_SPAWN_Z`` in ``lunarleaper_delta``). The PACE scene has no
+# ground plane, so this only sets where the held-in-air base sits.
+_FIXED_Z: float = 0.243
+
+
+@configclass
+class DeltaQuadrupedEventsCfg:
+    """Events for the delta-quadruped PACE environment.
+
+    The delta USD's articulation root is a non-rigid ``Xform``, so
+    ``fix_root_link`` cannot materialise a fixed joint (Isaac Lab raises
+    ``NotImplementedError`` because the root has no ``RigidBodyAPI``). Instead the
+    base is pinned kinematically: :func:`~pace_sim2real.tasks...mdp.hold_root_pose`
+    re-writes the root pose to :data:`_FIXED_Z` with identity orientation and zeroes
+    the root velocity every step (zero interval), holding the base still so the four
+    legs stay dynamically decoupled and each is fitted by its own CMA-ES process
+    within a single rollout.
+    """
+
+    hold_base = EventTerm(
+        func=mdp.hold_root_pose,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        is_global_time=True,
+        params={"height": _FIXED_Z},
+    )
+
+
 ##
 # Environment configuration
 ##
@@ -228,18 +257,20 @@ class DeltaQuadrupedPaceEnvCfg(PaceSim2realEnvCfg):
     sim2real: DeltaQuadrupedPaceCfg = DeltaQuadrupedPaceCfg()
     actions: DeltaQuadrupedActionsCfg = DeltaQuadrupedActionsCfg()
     observations: DeltaQuadrupedObservationsCfg = DeltaQuadrupedObservationsCfg()
+    events: DeltaQuadrupedEventsCfg = DeltaQuadrupedEventsCfg()
 
     def __post_init__(self):
-        # LUNARLEAPER_DELTA_CFG.spawn may have articulation_props=None; the base
-        # class __post_init__ touches fix_root_link on it, so initialise first.
+        # LUNARLEAPER_DELTA_CFG.spawn may have articulation_props=None; ensure it is
+        # initialised so self-collisions stay disabled on the loop-closed articulation.
+        # The base is NOT fixed via fix_root_link: the delta USD's articulation root is
+        # a non-rigid Xform, so Isaac Lab cannot materialise a fixed joint for it and
+        # raises NotImplementedError. It is instead pinned kinematically every step by
+        # the hold_base interval event (see DeltaQuadrupedEventsCfg), which keeps the
+        # four legs dynamically decoupled for the per-leg CMA-ES fit.
         if self.scene.robot.spawn.articulation_props is None:
             self.scene.robot.spawn.articulation_props = sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False
             )
-        # Fix the base in the air: this is the sys-id rig condition and, crucially,
-        # makes the four legs dynamically independent so they can be fitted by four
-        # separate CMA-ES processes within a single rollout.
-        self.scene.robot.spawn.articulation_props.fix_root_link = True
 
         super().__post_init__()
 
@@ -247,9 +278,84 @@ class DeltaQuadrupedPaceEnvCfg(PaceSim2realEnvCfg):
         # env.step). The control decimation used at training time (4) is a
         # control-rate choice; the physics-solver fidelity below is what governs
         # the leg/loop-closure dynamics the fit observes, and that is matched.
-        self.sim.dt = 0.005
-        self.decimation = 1
+        self.sim.dt = 0.00125
+        self.decimation = 4
 
         # MuJoCo-Warp physics, matched to the training preset
         # (LunarleaperDeltaPhysicsCfg in delta_velocity_env_cfg).
         self.sim.physics = DeltaQuadrupedPacePhysicsCfg()
+
+
+##
+# Footless medium-arm variant with mechanism-level gearbox play
+##
+
+# Body-centre hold height [m] for the medium-arm geometry (``_ALU_MEDIUM_SPAWN_Z``
+# in ``lunarleaper_delta``). Cosmetic only — the PACE scene has no ground plane.
+_FIXED_Z_MEDIUM: float = 0.247
+
+
+@configclass
+class DeltaQuadrupedNofootPaceSceneCfg(PaceSim2realSceneCfg):
+    """Scene with the footless medium-arm delta quadruped, gear play in the mechanism.
+
+    This is the machine the chirps were recorded on: medium arms (15 cm lower /
+    10.5 cm upper), the 93 g ball feet unbolted, and each motor split by a passive
+    ``*_backlash`` play joint. The motors are swapped for PaceDCMotor so the sys-id
+    parameters have somewhere to land; see :class:`DeltaQuadrupedPaceSceneCfg` for the
+    ``max_delay`` rationale.
+    """
+
+    robot: ArticulationCfg = LUNARLEAPER_ALU_DELTA_MEDIUM_BACKLASH_NOFOOT_CFG.replace(
+        prim_path="{ENV_REGEX_NS}/Robot",
+        actuators={
+            **LUNARLEAPER_ALU_DELTA_MEDIUM_BACKLASH_NOFOOT_CFG.actuators,
+            "motors": DELTA_QUADRUPED_MOTOR_PACE_CFG.replace(max_delay=7),
+        },
+    )
+
+
+@configclass
+class DeltaQuadrupedNofootPaceCfg(DeltaQuadrupedPaceCfg):
+    """PACE configuration for the footless quadruped, gear play held at the USD default."""
+
+    robot_name: str = "delta_quadruped_nofoot"
+    data_dir: str = "delta_quadruped_nofoot/chirp_data.pt"
+
+
+@configclass
+class DeltaQuadrupedNofootBacklashPaceCfg(DeltaQuadrupedNofootPaceCfg):
+    """Same, but the per-motor gear-play band is fitted alongside the other parameters.
+
+    Adds a per-joint parameter block (see :attr:`~PaceCfg.fit_backlash`). The hardware
+    encoders sit on the motor side of the gearbox, so the play is not directly visible as a
+    position offset; it is identified only through the inertia the motor sees while the gap
+    is open versus engaged.
+    """
+
+    robot_name: str = "delta_quadruped_nofoot_backlash"
+    fit_backlash: bool = True
+
+
+@configclass
+class DeltaQuadrupedNofootEventsCfg(DeltaQuadrupedEventsCfg):
+    """Base-pinning event at the medium-arm spawn height."""
+
+    def __post_init__(self):
+        self.hold_base.params = {"height": _FIXED_Z_MEDIUM}
+
+
+@configclass
+class DeltaQuadrupedNofootPaceEnvCfg(DeltaQuadrupedPaceEnvCfg):
+    """PACE environment for the footless, gear-play delta quadruped (play NOT fitted)."""
+
+    scene: DeltaQuadrupedNofootPaceSceneCfg = DeltaQuadrupedNofootPaceSceneCfg()
+    sim2real: DeltaQuadrupedNofootPaceCfg = DeltaQuadrupedNofootPaceCfg()
+    events: DeltaQuadrupedNofootEventsCfg = DeltaQuadrupedNofootEventsCfg()
+
+
+@configclass
+class DeltaQuadrupedNofootBacklashPaceEnvCfg(DeltaQuadrupedNofootPaceEnvCfg):
+    """Same environment, with the gear-play band added to the fitted parameters."""
+
+    sim2real: DeltaQuadrupedNofootBacklashPaceCfg = DeltaQuadrupedNofootBacklashPaceCfg()

@@ -5,8 +5,8 @@
 """Installation script for the 'pace_sim2real' python package."""
 
 import os
-import toml
 
+import toml
 from setuptools import setup
 
 # Obtain the extension data from the extension.toml file
@@ -18,6 +18,7 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 INSTALL_REQUIRES = [
     "psutil",
     "cmaes",
+    "plotly",
 ]
 
 # Installation operation

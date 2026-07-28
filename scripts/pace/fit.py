@@ -39,10 +39,10 @@ parser.add_argument(
     help="Override sim2real.robot_name (the logs/pace/<robot_name> subdir). Keeps per-leg fit logs separate.",
 )
 parser.add_argument(
-    "--fix_static_friction",
+    "--fix_coulomb_friction",
     type=float,
     default=None,
-    help="If set, pin every motor's static friction to this value [Nm] (held constant, not optimised).",
+    help="If set, pin every motor's Coulomb friction to this value [Nm] (held constant, not optimised).",
 )
 parser.add_argument("--wandb", action="store_true", help="Log the CMA-ES fit (incl. min score) to Weights & Biases.")
 parser.add_argument("--wandb_project", type=str, default="pace_sim2real", help="W&B project name.")
@@ -78,15 +78,15 @@ def main():
             env_cfg.sim2real.data_dir = args_cli.data_dir
         if args_cli.robot_name is not None:
             env_cfg.sim2real.robot_name = args_cli.robot_name
-        if args_cli.fix_static_friction is not None:
-            # Pin every motor's static-friction bound to a single value so CMA-ES holds
+        if args_cli.fix_coulomb_friction is not None:
+            # Pin every motor's Coulomb-friction bound to a single value so CMA-ES holds
             # it constant (denorm maps a degenerate [v, v] bound to v). Block layout:
-            # [2n:3n] = static friction; passive/extra joints are appended later and untouched.
+            # [n:2n] = Coulomb friction; passive/extra joints are appended later and untouched.
             n = len(env_cfg.sim2real.joint_order)
-            env_cfg.sim2real.bounds_params[2 * n : 3 * n, 0] = args_cli.fix_static_friction
-            env_cfg.sim2real.bounds_params[2 * n : 3 * n, 1] = args_cli.fix_static_friction
+            env_cfg.sim2real.bounds_params[n : 2 * n, 0] = args_cli.fix_coulomb_friction
+            env_cfg.sim2real.bounds_params[n : 2 * n, 1] = args_cli.fix_coulomb_friction
             print(
-                f"[INFO] Static friction PINNED at {args_cli.fix_static_friction} Nm for all {n} "
+                f"[INFO] Coulomb friction PINNED at {args_cli.fix_coulomb_friction} Nm for all {n} "
                 "motors (held constant, not optimised)."
             )
 
@@ -108,7 +108,9 @@ def main():
                     "max_iteration": env_cfg.sim2real.cmaes.max_iteration,
                     "sigma": env_cfg.sim2real.cmaes.sigma,
                     "joint_order": env_cfg.sim2real.joint_order,
-                    "fix_static_friction": args_cli.fix_static_friction,
+                    "fix_coulomb_friction": args_cli.fix_coulomb_friction,
+                    "fit_bias": env_cfg.sim2real.fit_bias,
+                    "fit_backlash": env_cfg.sim2real.fit_backlash,
                 },
             )
 
@@ -153,6 +155,23 @@ def main():
             bounds_params = torch.cat([bounds_params, extra_bounds], dim=0)
             print(f"[INFO]: Extra (passive) joints for optimisation: {extra_joint_names}")
 
+        # Resolve the gearbox-play joints when they are being fitted. One per motor,
+        # in the same order as joint_order, so the fitted band lands on the right joint.
+        backlash_joint_ids = None
+        if env_cfg.sim2real.fit_backlash:
+            backlash_names = [name.replace("_motor", "_backlash") for name in joint_order]
+            missing = [name for name in backlash_names if name not in articulation.joint_names]
+            if missing:
+                raise ValueError(
+                    f"fit_backlash=True but the robot has no play joints {missing}. Use an asset built with "
+                    "backlash_limit_rad set (e.g. build_delta_quadruped_alu.py --variant medium_backlash_nofoot)."
+                )
+            backlash_joint_ids = torch.tensor(
+                [articulation.joint_names.index(name) for name in backlash_names],
+                device=env.unwrapped.device,
+            )
+            print(f"[INFO]: Fitting gearbox play on: {backlash_names}")
+
         data_file = project_root() / "data" / env_cfg.sim2real.data_dir
         log_dir = project_root() / "logs" / "pace" / env_cfg.sim2real.robot_name
 
@@ -182,6 +201,8 @@ def main():
             joint_groups=env_cfg.sim2real.joint_groups,
             wandb_run=wandb_run,
             score_skip_steps=score_skip_steps,
+            fit_bias=env_cfg.sim2real.fit_bias,
+            fit_backlash=env_cfg.sim2real.fit_backlash,
         )
 
         # No warmup: env.reset() places the leg at the loop-consistent USD default
@@ -191,7 +212,9 @@ def main():
         # would distort the fit — and start replay straight from this FK-valid pose.
         env.reset()
         # initial_position=None: keep the FK-valid reset stance (don't overwrite motors).
-        opt.update_simulator(articulation, sim_joint_ids, extra_joint_ids=extra_joint_ids)
+        opt.update_simulator(
+            articulation, sim_joint_ids, extra_joint_ids=extra_joint_ids, backlash_joint_ids=backlash_joint_ids
+        )
 
         iteration_bar = tqdm(total=env_cfg.sim2real.cmaes.max_iteration, desc="CMA-ES", unit="iter")
         rollout_bar = tqdm(total=time_steps, desc="Rollout", unit="step", leave=False)
@@ -216,7 +239,12 @@ def main():
                     if opt.finished():
                         break
                     env.reset()
-                    opt.update_simulator(env.unwrapped.scene["robot"], sim_joint_ids, extra_joint_ids=extra_joint_ids)
+                    opt.update_simulator(
+                        env.unwrapped.scene["robot"],
+                        sim_joint_ids,
+                        extra_joint_ids=extra_joint_ids,
+                        backlash_joint_ids=backlash_joint_ids,
+                    )
 
         rollout_bar.close()
         iteration_bar.close()
@@ -228,11 +256,13 @@ def main():
             n = len(joint_order)
             for i, name in enumerate(joint_order):
                 wandb_run.summary[f"final_armature/{name}"] = best[i].item()
-                wandb_run.summary[f"final_viscous_friction/{name}"] = best[n + i].item()
-                wandb_run.summary[f"final_static_friction/{name}"] = best[2 * n + i].item()
-                wandb_run.summary[f"final_dynamic_friction/{name}"] = best[3 * n + i].item()
-                wandb_run.summary[f"final_bias/{name}"] = best[4 * n + i].item()
-            wandb_run.summary["final_delay"] = best[5 * n].item()
+                wandb_run.summary[f"final_coulomb_friction/{name}"] = best[n + i].item()
+                wandb_run.summary[f"final_viscous_damping/{name}"] = best[2 * n + i].item()
+                wandb_run.summary[f"final_bias/{name}"] = best[3 * n + i].item()
+                if env_cfg.sim2real.fit_backlash:
+                    # Total gear-play band [rad]; applied as +/-band/2 joint limits.
+                    wandb_run.summary[f"final_backlash/{name}"] = best[4 * n + 1 + i].item()
+            wandb_run.summary["final_delay"] = best[4 * n].item()
             wandb_run.finish()
 
         opt.close()

@@ -16,6 +16,8 @@ import cmaes
 import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
+from .sim_params import PaceParamIndex, apply_sim_params
+
 
 class CMAESOptimizer:
     def __init__(
@@ -35,6 +37,8 @@ class CMAESOptimizer:
         joint_groups=None,
         wandb_run=None,
         score_skip_steps=0,
+        fit_bias=True,
+        fit_backlash=False,
     ):
         """Initialize the CMA-ES optimizer.
 
@@ -80,10 +84,26 @@ class CMAESOptimizer:
                 gravity compensation) that the real recording does not contain;
                 excluding it keeps the fit from chasing that transient. The full
                 trajectory is still recorded for plotting.
+            fit_bias: When False, the encoder-bias block is dropped from the
+                CMA-ES search vector. The block stays in the global parameter
+                layout (so the bounds tensor and every downstream index are
+                unchanged) but is never sampled; it holds whatever value its
+                bounds' midpoint denormalises to, which the caller is expected to
+                pin to 0 by passing degenerate ``[0, 0]`` bias bounds.
+            fit_backlash: When True, a per-joint gearbox-play block is appended
+                after the delay scalar and optimised. Each entry is the *total*
+                play band [rad] of that motor's ``*_backlash`` joint, written as
+                symmetric ``±band/2`` position limits by :meth:`update_simulator`
+                (same convention as the ``randomize_backlash_joint_limits`` event).
+                The caller must size ``bounds`` accordingly and pass
+                ``backlash_joint_ids`` to :meth:`update_simulator`. When False the
+                block is absent and the USD's authored play limits are left alone.
         """
 
         self.wandb_run = wandb_run
         self.score_skip_steps = score_skip_steps
+        self.fit_bias = fit_bias
+        self.fit_backlash = fit_backlash
         self.joint_order = joint_order
         self.extra_joint_order = extra_joint_order or []
         self.max_iteration = max_iteration
@@ -105,6 +125,8 @@ class CMAESOptimizer:
                 "joint_order": joint_order,
                 "extra_joint_order": self.extra_joint_order,
                 "joint_groups": joint_groups,
+                "fit_bias": fit_bias,
+                "fit_backlash": fit_backlash,
                 "dof_pos": data["dof_pos"],
                 "des_dof_pos": data["des_dof_pos"],
                 "time": data["time"],
@@ -137,29 +159,46 @@ class CMAESOptimizer:
 
         num_joints = len(joint_order)
         self.num_joints = num_joints
-        # Parameter block layout (matches the env-cfg bounds_params and group_cols
-        # below): [armature, viscous, static, dynamic, bias, delay]. The viscous
-        # block is written to the simulator (joint friction coefficient); the
-        # static (stiction) and dynamic (Coulomb) blocks are applied manually in
-        # the PaceDCMotor actuator, since Kamino's sim-side dry friction breaks
-        # closed-loop settle. The actuator applies static friction below its speed
-        # threshold and dynamic friction at or above it. Keep this order in sync
-        # with both sinks (`apply` below) — swapping them pushes the wrong block
-        # into the sim and into the actuator.
-        self.armature_idx = slice(0, num_joints)
-        self.viscous_friction_idx = slice(num_joints, 2 * num_joints)
-        self.static_friction_idx = slice(2 * num_joints, 3 * num_joints)
-        self.dynamic_friction_idx = slice(3 * num_joints, 4 * num_joints)
-        self.bias_idx = slice(4 * num_joints, 5 * num_joints)
-        self.delay_idx = 5 * num_joints
-
-        # Extra (passive) joint parameters: appended after the delay scalar.
-        # Each extra joint gets an armature and a friction coefficient.
-        # These params are applied to the simulator but never scored.
+        # Parameter block layout: [armature, coulomb, viscous, bias, delay, (backlash)].
+        # Each block is named for the physical quantity it holds; see PaceParamIndex for the
+        # sink each one is written to.
+        # The layout (and the sinks each block is written to) is shared with offline
+        # replay tools; see :mod:`~pace_sim2real.optim.sim_params`. The aliases below keep
+        # the historic attribute names used throughout the logging code.
         num_extra = len(self.extra_joint_order)
-        _base = 5 * num_joints + 1
-        self.extra_armature_idx = slice(_base, _base + num_extra)
-        self.extra_friction_idx = slice(_base + num_extra, _base + 2 * num_extra)
+        self.idx = PaceParamIndex(num_joints, num_extra=num_extra, fit_backlash=fit_backlash)
+        self.armature_idx = self.idx.armature
+        self.coulomb_friction_idx = self.idx.coulomb_friction
+        self.viscous_damping_idx = self.idx.viscous_damping
+        self.bias_idx = self.idx.bias
+        self.delay_idx = self.idx.delay
+        # Optional gearbox-play block: the total play band [rad] of each motor's
+        # ``*_backlash`` joint, appended right after the delay scalar so the
+        # historic 5n+1 layout is untouched when the block is absent.
+        self.backlash_idx = self.idx.backlash
+        # Extra (passive) joint parameters trail everything else. They are applied to the
+        # simulator but never scored.
+        self.extra_armature_idx = self.idx.extra_armature
+        self.extra_friction_idx = self.idx.extra_friction
+
+        def _search_cols(joint_ids):
+            """Columns of the global parameter vector that CMA-ES searches for *joint_ids*.
+
+            Ordered [armature, coulomb, viscous, (bias), delay, (backlash)];
+            blocks disabled by ``fit_bias`` / ``fit_backlash`` are simply left out, so
+            they never cost the optimiser a search dimension while the global layout
+            (and every ``*_idx`` slice above) stays fixed.
+            """
+            n = num_joints
+            cols = [j for j in joint_ids]
+            cols += [n + j for j in joint_ids]
+            cols += [2 * n + j for j in joint_ids]
+            if fit_bias:
+                cols += [3 * n + j for j in joint_ids]
+            cols += [self.delay_idx]
+            if fit_backlash:
+                cols += [self.backlash_idx.start + j for j in joint_ids]
+            return cols
 
         # ----- per-group (multi-process) setup -----
         self.multi = joint_groups is not None and len(joint_groups) > 1
@@ -175,24 +214,16 @@ class CMAESOptimizer:
             self.num_groups = len(self.joint_groups)
             self.block = population_size // self.num_groups
 
-            # For each group, the columns of the global parameter vector it owns,
-            # ordered [armature(group), viscous(group), static(group),
-            # dynamic(group), bias(group), delay]. The delay column (index
-            # ``delay_idx``) is owned by every group but only ever written within
-            # that group's own (disjoint) block of environments, so there is no
-            # conflict.
-            n = num_joints
+            # For each group, the columns of the global parameter vector it owns
+            # (see ``_search_cols``). The delay column (index ``delay_idx``) is
+            # owned by every group but only ever written within that group's own
+            # (disjoint) block of environments, so there is no conflict.
             self.group_cols = []
+            self.group_delay_pos = []
             self.joint_to_group = [None] * num_joints
             for gi, jg in enumerate(self.joint_groups):
-                cols = (
-                    [j for j in jg]
-                    + [n + j for j in jg]
-                    + [2 * n + j for j in jg]
-                    + [3 * n + j for j in jg]
-                    + [4 * n + j for j in jg]
-                    + [self.delay_idx]
-                )
+                cols = _search_cols(jg)
+                self.group_delay_pos.append(cols.index(self.delay_idx))
                 self.group_cols.append(torch.tensor(cols, device=device, dtype=torch.long))
                 for j in jg:
                     self.joint_to_group[j] = gi
@@ -224,9 +255,17 @@ class CMAESOptimizer:
             # all joints scored in every environment
             self.score_mask = torch.ones((population_size, num_joints), device=device)
 
-            bounds_normalized = torch.ones_like(bounds)
+            # One CMA-ES over every joint, restricted to the enabled blocks. The
+            # extra (passive) joint columns trail the per-joint blocks and are
+            # always searched.
+            cols = _search_cols(list(range(num_joints)))
+            cols += list(range(self.extra_armature_idx.start, self.extra_friction_idx.stop))
+            self.active_cols = torch.tensor(cols, device=device, dtype=torch.long)
+
+            gb = bounds[self.active_cols]
+            bounds_normalized = torch.ones_like(gb)
             bounds_normalized[:, 0] *= -1
-            mean_normalized = torch.zeros_like(bounds[:, 0])
+            mean_normalized = torch.zeros_like(gb[:, 0])
             self.optimizer = cmaes.CMA(
                 mean=mean_normalized.cpu().numpy(),
                 sigma=sigma,
@@ -270,7 +309,7 @@ class CMAESOptimizer:
         else:
             solutions = []
             for i in range(self.optimizer.population_size):
-                solutions.append((self.params[i].cpu().numpy(), self.scores[i].item()))
+                solutions.append((self.params[i, self.active_cols].cpu().numpy(), self.scores[i].item()))
             self.optimizer.tell(solutions)
 
         if self.save_interval > 0 and self.iteration_counter % self.save_interval == 0:
@@ -317,11 +356,16 @@ class CMAESOptimizer:
                         self.optimizers[gi].ask(), device=self.device, dtype=self.params.dtype
                     )
         else:
+            self.params = torch.zeros_like(self.params)  # non-searched columns: normalized 0 = bound midpoint
             for i in range(self.optimizer.population_size):
-                self.params[i, :] = torch.tensor(self.optimizer.ask(), device=self.device)
+                self.params[i, self.active_cols] = torch.tensor(
+                    self.optimizer.ask(), device=self.device, dtype=self.params.dtype
+                )
         self.sim_params = self._params_to_sim_params(self.params)
 
-    def update_simulator(self, articulation, joint_ids, initial_position=None, extra_joint_ids=None):
+    def update_simulator(
+        self, articulation, joint_ids, initial_position=None, extra_joint_ids=None, backlash_joint_ids=None
+    ):
         """Write the current CMA-ES population's parameters into the simulator.
 
         Args:
@@ -338,50 +382,24 @@ class CMAESOptimizer:
                 solver must snap the closures shut (legacy behaviour).
             extra_joint_ids: Indices of the passive/extra joints (not scored).
                 When provided, their armature and friction are written too.
+            backlash_joint_ids: Indices of the ``*_backlash`` play joints, in the
+                same order as *joint_ids* (one per motor). Required when the
+                optimiser was built with ``fit_backlash=True``: each motor's
+                fitted play band ``b`` is written as symmetric position limits
+                ``(-b/2, +b/2)`` on its play joint, so the solver resolves the
+                gap traversal and the tooth impacts natively.
         """
-        env_ids = torch.arange(len(self.sim_params[:, self.armature_idx]), device=self.device)
-        articulation.write_joint_armature_to_sim_index(
-            armature=self.sim_params[:, self.armature_idx], joint_ids=joint_ids, env_ids=env_ids
+        env_ids = torch.arange(len(self.sim_params), device=self.device)
+        apply_sim_params(
+            articulation,
+            self.sim_params,
+            self.idx,
+            joint_ids,
+            env_ids=env_ids,
+            initial_position=initial_position,
+            extra_joint_ids=extra_joint_ids,
+            backlash_joint_ids=backlash_joint_ids,
         )
-        articulation.write_joint_friction_coefficient_to_sim_index(
-            joint_friction_coeff=self.sim_params[:, self.viscous_friction_idx], joint_ids=joint_ids, env_ids=env_ids
-        )
-        if initial_position is not None:
-            articulation.write_joint_position_to_sim_index(
-                position=initial_position + self.sim_params[:, self.bias_idx], joint_ids=joint_ids
-            )
-            articulation.write_joint_velocity_to_sim_index(
-                velocity=torch.zeros_like(initial_position), joint_ids=joint_ids
-            )
-        for drive_type, actuator in articulation.actuators.items():
-            if not hasattr(actuator, "update_encoder_bias"):
-                continue
-            drive_indices = actuator.joint_indices
-            if isinstance(drive_indices, slice):
-                all_idx = torch.arange(joint_ids.shape[0], device=joint_ids.device)
-                drive_indices = all_idx[drive_indices]
-            comparison_matrix = joint_ids.unsqueeze(1) == drive_indices.unsqueeze(0)
-            drive_joint_idx = torch.argmax(comparison_matrix.int(), dim=0)
-            actuator.update_encoder_bias(self.sim_params[:, self.bias_idx][:, drive_joint_idx])
-            actuator.update_static_friction(self.sim_params[:, self.static_friction_idx][:, drive_joint_idx])
-            actuator.update_dynamic_friction(self.sim_params[:, self.dynamic_friction_idx][:, drive_joint_idx])
-            actuator.update_time_lags(self.sim_params[:, self.delay_idx].to(torch.int))
-            actuator.reset(env_ids)
-
-        # Apply armature and friction for passive joints (bearings, etc.).
-        # These joints have no actuator and no real measurements; they affect
-        # the simulation dynamics and are thus optimised indirectly.
-        if extra_joint_ids is not None and len(self.extra_joint_order) > 0:
-            articulation.write_joint_armature_to_sim_index(
-                armature=self.sim_params[:, self.extra_armature_idx],
-                joint_ids=extra_joint_ids,
-                env_ids=env_ids,
-            )
-            articulation.write_joint_friction_coefficient_to_sim_index(
-                joint_friction_coeff=self.sim_params[:, self.extra_friction_idx],
-                joint_ids=extra_joint_ids,
-                env_ids=env_ids,
-            )
 
     def _print_iteration(self):
         if self.multi:
@@ -395,11 +413,12 @@ class CMAESOptimizer:
                 names = [self.joint_order[j] for j in jg]
                 print(f"  leg {gi} {names}: min score {block_scores[local_min].item():.6e}")
                 print(f"    Armature:        {self.sim_params[env, self.armature_idx][jg].tolist()}")
-                print(f"    Static Friction: {self.sim_params[env, self.static_friction_idx][jg].tolist()}")
-                print(f"    Dynamic Friction:{self.sim_params[env, self.dynamic_friction_idx][jg].tolist()}")
-                print(f"    Viscous Friction:{self.sim_params[env, self.viscous_friction_idx][jg].tolist()}")
+                print(f"    Viscous damping: {self.sim_params[env, self.viscous_damping_idx][jg].tolist()}")
+                print(f"    Coulomb friction:{self.sim_params[env, self.coulomb_friction_idx][jg].tolist()}")
                 print(f"    Bias:            {self.sim_params[env, self.bias_idx][jg].tolist()}")
                 print(f"    Delay:           {self.sim_params[env, self.delay_idx].item()}")
+                if self.fit_backlash:
+                    print(f"    Backlash band:   {self.sim_params[env, self.backlash_idx][jg].tolist()}")
             print(f"Elapsed time: {(datetime.now() - self._timer_start).total_seconds():.1f} seconds")
             self._timer_start = datetime.now()
             self._log()
@@ -411,11 +430,12 @@ class CMAESOptimizer:
         print("Max score: ", max_score.item())
         print("Min score: ", min_score.item(), " at index: ", min_index.item())
         print("Armature: ", self.sim_params[min_index, self.armature_idx].tolist())
-        print("Static Friction: ", self.sim_params[min_index, self.static_friction_idx].tolist())
-        print("Dynamic Friction: ", self.sim_params[min_index, self.dynamic_friction_idx].tolist())
-        print("Viscous Friction: ", self.sim_params[min_index, self.viscous_friction_idx].tolist())
+        print("Viscous damping: ", self.sim_params[min_index, self.viscous_damping_idx].tolist())
+        print("Coulomb friction: ", self.sim_params[min_index, self.coulomb_friction_idx].tolist())
         print("Bias: ", self.sim_params[min_index, self.bias_idx].tolist())
         print("Delay: ", self.sim_params[min_index, self.delay_idx].tolist())
+        if self.fit_backlash:
+            print("Backlash band: ", self.sim_params[min_index, self.backlash_idx].tolist())
         if self.extra_joint_order:
             print("Extra Armature: ", self.sim_params[min_index, self.extra_armature_idx].tolist())
             print("Extra Friction: ", self.sim_params[min_index, self.extra_friction_idx].tolist())
@@ -441,15 +461,18 @@ class CMAESOptimizer:
         for gi in range(self.num_groups):
             mean_g = torch.tensor(self.optimizers[gi]._mean, device=self.device)
             gparams[self.group_cols[gi]] = mean_g
-            delay_means.append(mean_g[-1])  # last entry of each group vector is delay
+            delay_means.append(mean_g[self.group_delay_pos[gi]])
         gparams[self.delay_idx] = torch.stack(delay_means).mean()
         return gparams
 
     def get_best_sim_params(self):
         if self.multi:
             return self._params_to_sim_params(self._assemble_global_mean())
-        best_params = torch.tensor(self.optimizer._mean, device=self.device)
-        return self._params_to_sim_params(best_params)
+        # Scatter the searched-column mean back into the full layout; unsearched
+        # columns keep normalized 0, i.e. their bounds' midpoint.
+        gparams = torch.zeros(self.bounds.shape[0], device=self.device)
+        gparams[self.active_cols] = torch.tensor(self.optimizer._mean, device=self.device, dtype=gparams.dtype)
+        return self._params_to_sim_params(gparams)
 
     def _log(self):
         if self.multi:
@@ -464,18 +487,13 @@ class CMAESOptimizer:
                 self.iteration_counter,
             )
             self.writer.add_histogram(
-                "3_Viscous_Friction/distribution_" + self.joint_order[i],
-                self.sim_params[:, self.viscous_friction_idx][:, i],
+                "3_Coulomb_Friction/distribution_" + self.joint_order[i],
+                self.sim_params[:, self.coulomb_friction_idx][:, i],
                 self.iteration_counter,
             )
             self.writer.add_histogram(
-                "2b_Dynamic_Friction/distribution_" + self.joint_order[i],
-                self.sim_params[:, self.dynamic_friction_idx][:, i],
-                self.iteration_counter,
-            )
-            self.writer.add_histogram(
-                "2_Static_Friction/distribution_" + self.joint_order[i],
-                self.sim_params[:, self.static_friction_idx][:, i],
+                "2_Viscous_Damping/distribution_" + self.joint_order[i],
+                self.sim_params[:, self.viscous_damping_idx][:, i],
                 self.iteration_counter,
             )
             self.writer.add_histogram(
@@ -490,18 +508,13 @@ class CMAESOptimizer:
                 self.iteration_counter,
             )
             self.writer.add_scalar(
-                "3_Viscous_Friction/best_" + self.joint_order[i],
-                self.sim_params[min_score_index, self.viscous_friction_idx][i].item(),
+                "3_Coulomb_Friction/best_" + self.joint_order[i],
+                self.sim_params[min_score_index, self.coulomb_friction_idx][i].item(),
                 self.iteration_counter,
             )
             self.writer.add_scalar(
-                "2b_Dynamic_Friction/best_" + self.joint_order[i],
-                self.sim_params[min_score_index, self.dynamic_friction_idx][i].item(),
-                self.iteration_counter,
-            )
-            self.writer.add_scalar(
-                "2_Static_Friction/best_" + self.joint_order[i],
-                self.sim_params[min_score_index, self.static_friction_idx][i].item(),
+                "2_Viscous_Damping/best_" + self.joint_order[i],
+                self.sim_params[min_score_index, self.viscous_damping_idx][i].item(),
                 self.iteration_counter,
             )
             self.writer.add_scalar(
@@ -509,6 +522,17 @@ class CMAESOptimizer:
                 self.sim_params[min_score_index, self.armature_idx][i].item(),
                 self.iteration_counter,
             )
+            if self.fit_backlash:
+                self.writer.add_histogram(
+                    "6_Backlash/distribution_" + self.joint_order[i],
+                    self.sim_params[:, self.backlash_idx][:, i],
+                    self.iteration_counter,
+                )
+                self.writer.add_scalar(
+                    "6_Backlash/best_" + self.joint_order[i],
+                    self.sim_params[min_score_index, self.backlash_idx][i].item(),
+                    self.iteration_counter,
+                )
         self.writer.add_histogram("0_Delay/distribution", self.sim_params[:, self.delay_idx], self.iteration_counter)
         self.writer.add_scalar(
             "0_Delay/best", self.sim_params[min_score_index, self.delay_idx].item(), self.iteration_counter
@@ -549,16 +573,15 @@ class CMAESOptimizer:
             }
             for i, name in enumerate(self.joint_order):
                 metrics[f"armature/{name}"] = self.sim_params[min_score_index, self.armature_idx][i].item()
-                metrics[f"viscous_friction/{name}"] = self.sim_params[min_score_index, self.viscous_friction_idx][
+                metrics[f"coulomb_friction/{name}"] = self.sim_params[min_score_index, self.coulomb_friction_idx][
                     i
                 ].item()
-                metrics[f"static_friction/{name}"] = self.sim_params[min_score_index, self.static_friction_idx][
-                    i
-                ].item()
-                metrics[f"dynamic_friction/{name}"] = self.sim_params[min_score_index, self.dynamic_friction_idx][
+                metrics[f"viscous_damping/{name}"] = self.sim_params[min_score_index, self.viscous_damping_idx][
                     i
                 ].item()
                 metrics[f"bias/{name}"] = self.sim_params[min_score_index, self.bias_idx][i].item()
+                if self.fit_backlash:
+                    metrics[f"backlash/{name}"] = self.sim_params[min_score_index, self.backlash_idx][i].item()
             for i, name in enumerate(self.extra_joint_order):
                 metrics[f"extra_armature/{name}"] = self.sim_params[min_score_index, self.extra_armature_idx][i].item()
                 metrics[f"extra_friction/{name}"] = self.sim_params[min_score_index, self.extra_friction_idx][i].item()
@@ -589,18 +612,13 @@ class CMAESOptimizer:
                 self.iteration_counter,
             )
             self.writer.add_histogram(
-                "3_Viscous_Friction/distribution_" + self.joint_order[i],
-                self.sim_params[lo:hi, self.viscous_friction_idx][:, i],
+                "3_Coulomb_Friction/distribution_" + self.joint_order[i],
+                self.sim_params[lo:hi, self.coulomb_friction_idx][:, i],
                 self.iteration_counter,
             )
             self.writer.add_histogram(
-                "2b_Dynamic_Friction/distribution_" + self.joint_order[i],
-                self.sim_params[lo:hi, self.dynamic_friction_idx][:, i],
-                self.iteration_counter,
-            )
-            self.writer.add_histogram(
-                "2_Static_Friction/distribution_" + self.joint_order[i],
-                self.sim_params[lo:hi, self.static_friction_idx][:, i],
+                "2_Viscous_Damping/distribution_" + self.joint_order[i],
+                self.sim_params[lo:hi, self.viscous_damping_idx][:, i],
                 self.iteration_counter,
             )
             self.writer.add_histogram(
@@ -615,18 +633,13 @@ class CMAESOptimizer:
                 self.iteration_counter,
             )
             self.writer.add_scalar(
-                "3_Viscous_Friction/best_" + self.joint_order[i],
-                self.sim_params[me, self.viscous_friction_idx][i].item(),
+                "3_Coulomb_Friction/best_" + self.joint_order[i],
+                self.sim_params[me, self.coulomb_friction_idx][i].item(),
                 self.iteration_counter,
             )
             self.writer.add_scalar(
-                "2b_Dynamic_Friction/best_" + self.joint_order[i],
-                self.sim_params[me, self.dynamic_friction_idx][i].item(),
-                self.iteration_counter,
-            )
-            self.writer.add_scalar(
-                "2_Static_Friction/best_" + self.joint_order[i],
-                self.sim_params[me, self.static_friction_idx][i].item(),
+                "2_Viscous_Damping/best_" + self.joint_order[i],
+                self.sim_params[me, self.viscous_damping_idx][i].item(),
                 self.iteration_counter,
             )
             self.writer.add_scalar(
@@ -634,6 +647,17 @@ class CMAESOptimizer:
                 self.sim_params[me, self.armature_idx][i].item(),
                 self.iteration_counter,
             )
+            if self.fit_backlash:
+                self.writer.add_histogram(
+                    "6_Backlash/distribution_" + self.joint_order[i],
+                    self.sim_params[lo:hi, self.backlash_idx][:, i],
+                    self.iteration_counter,
+                )
+                self.writer.add_scalar(
+                    "6_Backlash/best_" + self.joint_order[i],
+                    self.sim_params[me, self.backlash_idx][i].item(),
+                    self.iteration_counter,
+                )
 
         for gi in range(self.num_groups):
             lo, hi = gi * self.block, (gi + 1) * self.block
@@ -656,10 +680,11 @@ class CMAESOptimizer:
             for i, name in enumerate(self.joint_order):
                 me = group_min_env[self.joint_to_group[i]]
                 metrics[f"armature/{name}"] = self.sim_params[me, self.armature_idx][i].item()
-                metrics[f"viscous_friction/{name}"] = self.sim_params[me, self.viscous_friction_idx][i].item()
-                metrics[f"static_friction/{name}"] = self.sim_params[me, self.static_friction_idx][i].item()
-                metrics[f"dynamic_friction/{name}"] = self.sim_params[me, self.dynamic_friction_idx][i].item()
+                metrics[f"coulomb_friction/{name}"] = self.sim_params[me, self.coulomb_friction_idx][i].item()
+                metrics[f"viscous_damping/{name}"] = self.sim_params[me, self.viscous_damping_idx][i].item()
                 metrics[f"bias/{name}"] = self.sim_params[me, self.bias_idx][i].item()
+                if self.fit_backlash:
+                    metrics[f"backlash/{name}"] = self.sim_params[me, self.backlash_idx][i].item()
             # Best rollout's command/real/sim trajectory (each joint from its group's best env).
             # Merge into the same log call/step as the metrics (a second same-step log is dropped).
             metrics.update(
@@ -671,25 +696,88 @@ class CMAESOptimizer:
 
     # Max points per line in the W&B trajectory plots (the raw chirp is ~6k steps;
     # downsampling keeps the logged data small while staying visually faithful).
-    _TRAJ_PLOT_MAX_POINTS = 400
+    _TRAJ_PLOT_MAX_POINTS = 1500
 
     def _best_trajectory_charts(self, env_for_joint):
         """Build the W&B trajectory visualisation of the best rollout (command/real/sim).
 
-        Returns ``{"trajectory/img": wandb.Image}`` to be merged into the iteration's single
+        Returns ``{"trajectory/plot": wandb.Plotly}`` to be merged into the iteration's single
         ``wandb_run.log(...)`` call (a second ``log`` at an already-used step is dropped by W&B).
 
-        A small, downsampled, low-dpi PNG stacking all joints. Media panels render reliably and
-        scrub across iterations, and the image is kept small (~50 kB) — lighter *and* more robust
-        than ``wandb.plot.line_series`` custom charts, which log a full table per joint per
-        iteration (~3x larger) and render unreliably when logged every step.
+        An interactive Plotly figure stacking all joints (zoom/pan/hover, per-series toggling
+        via the legend) that W&B scrubs across iterations. Falls back to the older downsampled
+        matplotlib PNG (``{"trajectory/img": wandb.Image}``) when plotly is not installed, e.g.
+        in cluster images built before it became a dependency.
 
         ``env_for_joint[i]`` is the environment whose sim trajectory to use for joint ``i``.
         """
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+        except ImportError:
+            return self._best_trajectory_image(env_for_joint)
+        import wandb
+
+        t = self.traj_time.cpu().numpy()
+        stride = max(1, len(t) // self._TRAJ_PLOT_MAX_POINTS)
+        # Plain (rounded) python lists keep the figure JSON compact and avoid plotly's
+        # binary numpy encoding, which older plotly.js bundles in the W&B UI can't render.
+        t_ds = [round(v, 5) for v in t[::stride].astype(float).tolist()]
+        n = len(self.joint_order)
+        skip_t = float(t[self.score_skip_steps]) if 0 < self.score_skip_steps < len(t) else 0.0
+
+        # Three clearly distinct styles so command/real/sim never blur together when overlapping.
+        styles = {
+            "command": dict(color="#2ca02c", dash="dash", width=1.2),  # green, dashed
+            "real": dict(color="#1f77b4", dash="solid", width=1.5),  # blue, solid
+            "sim": dict(color="#d62728", dash="solid", width=1.2),  # red, solid
+        }
+
+        fig = make_subplots(rows=n, cols=1, shared_xaxes=True, vertical_spacing=min(0.03, 0.3 / n))
+        for i, name in enumerate(self.joint_order):
+            env = int(env_for_joint[i])
+            series = {
+                "command": self.des_dof_pos[:, i],
+                "real": self.real_dof_pos[:, i],
+                "sim": self.sim_dof_pos_buffer[env, :, i],
+            }
+            for label, data in series.items():
+                y = [round(v, 5) for v in data.cpu().numpy()[::stride].astype(float).tolist()]
+                fig.add_trace(
+                    go.Scatter(
+                        x=t_ds,
+                        y=y,
+                        name=label,
+                        legendgroup=label,
+                        showlegend=(i == 0),
+                        mode="lines",
+                        line=styles[label],
+                    ),
+                    row=i + 1,
+                    col=1,
+                )
+            fig.update_yaxes(
+                title_text=name.replace("single_leg_", ""), title_font_size=10, tickfont_size=9, row=i + 1, col=1
+            )
+        if skip_t > 0.0:
+            fig.add_vrect(x0=t_ds[0], x1=skip_t, fillcolor="grey", opacity=0.15, line_width=0, row="all", col="all")
+        fig.update_xaxes(title_text="time [s]", title_font_size=10, tickfont_size=9, row=n, col=1)
+        fig.update_layout(
+            height=max(360, 170 * n),
+            title=dict(text=f"iter {self.iteration_counter}  (first {skip_t:.2f}s excluded)", font_size=12),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0, font_size=10),
+            margin=dict(l=60, r=20, t=60, b=40),
+            hovermode="x unified",
+        )
+        return {"trajectory/plot": wandb.Plotly(fig)}
+
+    def _best_trajectory_image(self, env_for_joint):
+        """Matplotlib PNG fallback for :meth:`_best_trajectory_charts` when plotly is unavailable."""
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+
         import wandb
 
         t = self.traj_time.cpu().numpy()
